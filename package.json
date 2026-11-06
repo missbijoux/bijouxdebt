@@ -1,0 +1,17 @@
+{
+  "name": "bijouxdebt",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Personal debt and tribute book for Dominatrix Bijoux, with Lightning checkout.",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test ledger.test.mjs server.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}
