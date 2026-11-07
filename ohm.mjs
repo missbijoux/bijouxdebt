@@ -8,6 +8,12 @@ import { Buffer } from 'node:buffer';
 
 const RATE_URL = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd';
 
+export const LND_CONNECT_TIMEOUT_MS = 10_000;
+const RATE_TIMEOUT_MS = 5_000;
+const MIN_CONNECT_MS = 2_000;
+
+class LndTimeout extends Error {}
+
 let rateCache = { at: 0, usd: 0 };
 
 export function satsForCents(amountCents, btcUsd) {
@@ -63,12 +69,18 @@ function lndAgent() {
   });
 }
 
-function lndRequest(path, method, body) {
+/**
+ * req.setTimeout only starts once a socket is connected, so a node that drops
+ * packets would hang until the operating system gives up. The connect timer
+ * starts with the request and stops once TLS is up or a response arrives.
+ */
+export function lndRequest(path, method, body, { connectTimeoutMs = LND_CONNECT_TIMEOUT_MS } = {}) {
   const { host, port } = lndTarget();
   const macaroon = process.env.LND_MACAROON_HEX || '';
   if (!macaroon) throw new Error('Lightning checkout is not configured.');
   const payload = body ? JSON.stringify(body) : null;
   return new Promise((resolve, reject) => {
+    let connectTimer = null;
     const req = https.request(
       {
         host,
@@ -83,6 +95,7 @@ function lndRequest(path, method, body) {
         },
       },
       (res) => {
+        clearTimeout(connectTimer);
         const chunks = [];
         res.on('data', (chunk) => chunks.push(chunk));
         res.on('end', () => {
@@ -99,10 +112,20 @@ function lndRequest(path, method, body) {
         });
       },
     );
-    req.setTimeout(15000, () => {
-      req.destroy(new Error('Lightning node timed out.'));
+    const seconds = Math.ceil(connectTimeoutMs / 1000);
+    connectTimer = setTimeout(() => {
+      req.destroy(new LndTimeout(`Lightning node did not answer within ${seconds} second${seconds === 1 ? '' : 's'}.`));
+    }, connectTimeoutMs);
+    req.on('socket', (socket) => {
+      socket.once('secureConnect', () => clearTimeout(connectTimer));
     });
-    req.on('error', () => reject(new Error('Lightning node could not be reached.')));
+    req.setTimeout(15000, () => {
+      req.destroy(new LndTimeout('Lightning node timed out.'));
+    });
+    req.on('error', (error) => {
+      clearTimeout(connectTimer);
+      reject(new Error(error instanceof LndTimeout ? error.message : 'Lightning node could not be reached.'));
+    });
     if (payload) req.write(payload);
     req.end();
   });
@@ -110,7 +133,7 @@ function lndRequest(path, method, body) {
 
 async function bitcoinUsd() {
   if (Date.now() - rateCache.at < 60_000 && rateCache.usd) return rateCache.usd;
-  const response = await fetch(RATE_URL, { signal: AbortSignal.timeout(8000) });
+  const response = await fetch(RATE_URL, { signal: AbortSignal.timeout(RATE_TIMEOUT_MS) });
   if (!response.ok) throw new Error('Could not price Bitcoin, so no invoice was created.');
   const body = await response.json();
   const usd = body?.bitcoin?.usd;
@@ -125,6 +148,7 @@ export function createOhm() {
       return process.env.LND_MACAROON_HEX ? 'live' : 'sandbox';
     },
     async createInvoice({ amountCents, memo }) {
+      const started = Date.now();
       const btcUsd = await bitcoinUsd();
       const amountSats = satsForCents(amountCents, btcUsd);
       const includeRouteHints = process.env.LND_INVOICE_INCLUDE_ROUTE_HINTS !== 'false';
@@ -134,7 +158,8 @@ export function createOhm() {
         expiry: '3600',
       };
       if (includeRouteHints) body.private = true;
-      const created = await lndRequest('/v1/invoices', 'POST', body);
+      const left = LND_CONNECT_TIMEOUT_MS - (Date.now() - started);
+      const created = await lndRequest('/v1/invoices', 'POST', body, { connectTimeoutMs: Math.max(left, MIN_CONNECT_MS) });
       const paymentHashHex = Buffer.from(created.r_hash, 'base64').toString('hex');
       const bolt11 = String(created.payment_request || '').trim().replace(/^lightning:/i, '');
       if (!/^ln[a-z0-9]+$/i.test(bolt11) || !/^[a-f0-9]+$/i.test(paymentHashHex)) {
