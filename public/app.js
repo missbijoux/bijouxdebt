@@ -43,6 +43,7 @@ const state = {
   invoice: null,
   error: '',
   formError: null,
+  formNotice: null,
   notice: '',
   poll: 0,
   live: 0,
@@ -124,8 +125,26 @@ function field(label, control) {
 }
 
 function errorSlot(key) {
-  if (state.formError?.key !== key) return null;
-  return el('p', { class: 'error form-error', role: 'alert' }, state.formError.message);
+  if (state.formError?.key === key) return el('p', { class: 'error form-error', role: 'alert' }, state.formError.message);
+  if (state.formNotice?.key === key) return el('p', { class: 'notice form-notice', role: 'status' }, state.formNotice.message);
+  return null;
+}
+
+/** Long pages put the top notice out of view, so a success stays next to the form or button that asked for it. */
+function noteBesideForm(key) {
+  if (!key || !state.notice) return;
+  const message = state.notice;
+  state.formNotice = { key, message };
+  state.notice = '';
+  render();
+  const shown = document.querySelector('.form-notice');
+  if (shown) {
+    shown.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    return;
+  }
+  state.formNotice = null;
+  state.notice = message;
+  render();
 }
 
 function form(key, action, ...children) {
@@ -159,8 +178,10 @@ function revealError() {
 async function press(key, action) {
   state.error = '';
   state.formError = null;
+  state.formNotice = null;
   try {
     await action();
+    noteBesideForm(key);
   } catch (error) {
     state.formError = { key, message: error.message };
     render();
@@ -653,12 +674,14 @@ async function submit(event, action) {
   event.preventDefault();
   state.error = '';
   state.formError = null;
+  state.formNotice = null;
   const key = event.target.getAttribute('data-form');
   const restore = keepValues(event.target);
   const button = event.submitter;
   if (button) button.disabled = true;
   try {
     await action(event, restore);
+    noteBesideForm(key);
   } catch (error) {
     if (key) state.formError = { key, message: error.message };
     else state.error = error.message;
@@ -1305,7 +1328,8 @@ async function saveGameCaps(event, key) {
 
 async function loadAtm(event) {
   const addCents = dollarsToCents(new FormData(event.target).get('amount'));
-  await refreshGames(await api('/api/me/atm/load', { method: 'POST', body: { addCents } }), 'The ATM is loaded.');
+  const next = await api('/api/me/atm/load', { method: 'POST', body: { addCents } });
+  await refreshGames(next, `Loaded ${money(addCents)}. The ATM now holds ${money(next.sub.atm.balanceCents)}.`);
 }
 
 async function lowerAtm(event) {
@@ -1732,6 +1756,7 @@ async function boot() {
 
 window.addEventListener('hashchange', () => {
   state.formError = null;
+  state.formNotice = null;
   render();
   window.scrollTo(0, 0);
 });

@@ -164,7 +164,7 @@ footer { margin-top: 40px; color: var(--muted); display: grid; gap: 8px; }
 .spaced { margin-top: 36px; }
 main > .panel, main > section { margin-bottom: 18px; }
 .panel form, .panel .accept { margin-top: 18px; }
-.form-error { margin: 12px 0 0; }
+.form-error, .form-notice { margin: 12px 0 0; }
 details > summary { cursor: pointer; color: var(--gold-2); margin: 12px 0; }
 .label { display: block; margin: 12px 0 8px; }
 
