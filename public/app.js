@@ -1133,6 +1133,9 @@ function slotPanel(sub) {
   else if (cooling) blocked = `Cooling down until ${clock(game.nextPlayAt)}.`;
   else if (game.leftTodayCents < game.odds.maxChargeCents) blocked = `Today's cap is reached. ${money(game.leftTodayCents)} is left, and a spin can cost ${money(game.odds.maxChargeCents)}.`;
   const pending = hasPendingPlay('slot');
+  const maxUnpaid = sub.standing?.rules?.maxUnpaidGameCents || 0;
+  const unpaidStop = sub.debt?.status === 'active' && maxUnpaid > 0
+    && (sub.standing.unpaidGameCents || 0) + game.odds.maxChargeCents > maxUnpaid;
   return el('section', { class: 'panel', id: 'slot' },
     el('h2', null, 'Slot machine'),
     el('p', { class: 'rigged' }, game.odds.rigged),
@@ -1147,7 +1150,12 @@ function slotPanel(sub) {
         disabled: state.spin.busy || (Boolean(blocked) && !pending),
         onclick: spin,
       }, state.spin.busy ? 'Spinning…' : pending ? 'Finish the last spin' : `Spin · ${money(game.odds.stakeCents)} stake`),
-      blocked && !state.spin.busy ? el('p', { class: 'muted' }, blocked) : null,
+      unpaidStop && !state.spin.busy && !pending
+        ? el('div', { class: 'play-stop', role: 'alert' },
+          el('p', { class: 'play-stop-title' }, `Sorry, you must pay your debt after ${money(maxUnpaid).replace(/\.00$/, '')}+ is due before you can continue playing!`),
+          el('p', null, blocked),
+          el('a', { class: 'btn', href: '#/book' }, 'Pay now'))
+        : blocked && !state.spin.busy ? el('p', { class: 'muted' }, blocked) : null,
       el('p', { class: 'muted' }, `Today ${money(game.todayCents)} of ${money(game.limits.dailyCapCents)}. Average charge per spin ${averageText(game.odds.average)}.`),
       errorSlot('slot-play'),
     ),
