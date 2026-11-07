@@ -626,6 +626,8 @@ test('games stay locked until real money arrives, and for holds, missed minimums
     const over = await spin();
     assert.equal(over.status, 423);
     assert.match(over.json.error, /would pass her limit of \$40\.00/);
+    const shown = await alice.call(port, 'GET', '/api/session');
+    assert.match(shown.json.sub.games.slot.locks[0], /would pass her limit of \$40\.00/);
     await studio.call(port, 'POST', '/api/studio/payment', { subId: aliceId, amountCents: 2_000, purpose: 'debt' });
     const second = await spin();
     assert.equal(second.status, 200);

@@ -610,6 +610,7 @@ export function gameView(sub, key, now, today) {
   const last = plays.at(-1);
   const todayCents = chargedOn(plays, key, today);
   const nextMs = last ? Date.parse(last.at) + limits.cooldownSeconds * 1000 : 0;
+  const odds = key === 'slot' ? slotOdds(game.terms, limits.perPlayCapCents) : atmOdds(game.terms);
   return {
     key,
     name: GAMES[key],
@@ -622,10 +623,11 @@ export function gameView(sub, key, now, today) {
     limits,
     subLimits: { perPlayCapCents: game.subPerPlayCapCents, dailyCapCents: game.subDailyCapCents },
     pausedBySub: game.pausedBySub,
-    odds: key === 'slot' ? slotOdds(game.terms, limits.perPlayCapCents) : atmOdds(game.terms),
+    odds,
     todayCents,
     leftTodayCents: Math.max(limits.dailyCapCents - todayCents, 0),
-    locks: gameLocks(sub, today).map((lock) => lock.message),
+    // A spin always risks its top charge; an ATM withdrawal's depends on the option she picks, so the server checks it then.
+    locks: gameLocks(sub, today, key === 'slot' ? odds.maxChargeCents : 0).map((lock) => lock.message),
     nextPlayAt: nextMs > now.getTime() ? new Date(nextMs).toISOString() : null,
     plays: plays.slice(-25),
   };
