@@ -3,6 +3,29 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import QRCode from 'qrcode';
+import {
+  acceptGame,
+  assertPlayable,
+  atmLocked,
+  atmOdds,
+  atmView,
+  drawKick,
+  drawSkim,
+  drawSlot,
+  effectiveLimits,
+  GameError,
+  gameKeyOf,
+  GAMES,
+  gameView,
+  newGame,
+  normalizeTerms,
+  reviseGame,
+  setSubLimits,
+  slotOdds,
+  slotOutcomeIndex,
+  trimPlays,
+  upgradeSub,
+} from './games.mjs';
 import { accrue, applyConfirmedPayment, LIMITS, money, nextDueLabel, nyDate } from './ledger.mjs';
 import { createOhm } from './ohm.mjs';
 import { createStore, hashSecret, newId, TITLES, verifySecret } from './store.mjs';
@@ -87,13 +110,59 @@ function privateSub(sub, now) {
     sentCents: sub.sentCents,
     tributeCents: sub.tributeCents,
     askCents: sub.askCents,
-    purseCapCents: sub.purseCapCents,
-    purseDrawnCents: sub.purseDrawnCents,
     hideFromHall: sub.hideFromHall,
     debt,
     tasks: sub.tasks,
+    games: {
+      slot: gameView(sub, 'slot', now, nyDate(now)),
+      atm: gameView(sub, 'atm', now, nyDate(now)),
+    },
+    atm: atmView(sub.atm, now),
     entries: sub.entries.slice(-200),
   };
+}
+
+function playIdOf(value) {
+  const id = String(value || '');
+  if (!/^[a-f0-9]{16,64}$/.test(id)) throw new HttpError(400, 'Each play needs its own id.');
+  return id;
+}
+
+function priorPlay(sub, playId, key) {
+  const prior = sub.plays.find((play) => play.id === playId);
+  if (prior && prior.game !== key) throw new HttpError(409, 'That play id belongs to another game.');
+  return prior || null;
+}
+
+/** The one place a game result touches money. It can only raise an active signed debt. */
+function recordPlay(sub, play, now) {
+  if (!Number.isInteger(play.amountCents) || play.amountCents <= 0) {
+    throw new HttpError(500, 'A game result must be a positive charge.');
+  }
+  if (sub.debt?.status !== 'active') throw new HttpError(400, 'Games only add to an active signed debt.');
+  const before = sub.debt.balanceCents;
+  sub.debt.balanceCents += play.amountCents;
+  const entry = pushEntry(sub, stampEntry({
+    kind: 'game',
+    game: play.game,
+    outcome: play.label,
+    amountCents: play.amountCents,
+    purpose: 'debt',
+    source: 'game',
+    note: `${GAMES[play.game]}: ${play.label}`,
+    playId: play.id,
+  }, now));
+  const saved = {
+    ...play,
+    at: entry.at,
+    nyDay: entry.nyDay,
+    entryId: entry.id,
+    balanceBeforeCents: before,
+    balanceAfterCents: sub.debt.balanceCents,
+  };
+  sub.plays.push(saved);
+  trimPlays(sub.plays, entry.nyDay);
+  return saved;
 }
 
 function stampEntry(partial, now) {
@@ -337,13 +406,12 @@ export function createServer(options = {}) {
             sentCents: 0,
             tributeCents: 0,
             askCents: 0,
-            purseCapCents: 0,
-            purseDrawnCents: 0,
             hideFromHall: false,
             debt: null,
             tasks: [],
             entries: [],
           };
+          upgradeSub(sub);
           book.subs.push(sub);
           const session = { id: newId(32), role: 'sub', subId: sub.id, expires: new Date(now.getTime() + SESSION_MS).toISOString() };
           book.sessions.push(session);
@@ -445,21 +513,143 @@ export function createServer(options = {}) {
           return { sub: privateSub(sub, now) };
         });
       },
-      'POST /api/me/purse': async () => {
+      'GET /api/me/live': async () => {
+        const session = requireSub(data(), token, now);
+        return { sub: privateSub(findSub(data(), session.subId), now) };
+      },
+      'POST /api/me/game/accept': async () => {
         const session = requireSub(data(), token, now);
         const body = await readBody(req);
-        const cap = cents(body.capCents, 0, LIMITS.maxPurseCents, 'The purse');
+        const key = gameKeyOf(body.game);
         return store.update((book) => {
           const sub = findSub(book, session.subId);
-          if (cap < sub.purseDrawnCents) {
-            throw new HttpError(400, 'The ceiling cannot sit below what she has already drawn.');
-          }
-          sub.purseCapCents = cap;
+          const game = sub.games[key];
+          if (!game) throw new HttpError(404, `She has not set up the ${GAMES[key].toLowerCase()} for you.`);
+          if (game.acceptedVersion === game.version) throw new HttpError(400, 'You already accepted these terms.');
+          acceptGame(game, body.version, now);
           pushEntry(sub, stampEntry({
             kind: 'note',
-            amountCents: cap,
+            amountCents: 0,
             source: 'sub',
-            note: `Purse ceiling set to ${money(cap)}`,
+            note: `${GAMES[key]} terms accepted (version ${game.version})`,
+          }, now));
+          return { sub: privateSub(sub, now) };
+        });
+      },
+      'POST /api/me/game/limits': async () => {
+        const session = requireSub(data(), token, now);
+        const body = await readBody(req);
+        const key = gameKeyOf(body.game);
+        return store.update((book) => {
+          const sub = findSub(book, session.subId);
+          const game = sub.games[key];
+          if (!game) throw new HttpError(404, `She has not set up the ${GAMES[key].toLowerCase()} for you.`);
+          const wasPaused = game.pausedBySub;
+          setSubLimits(game, {
+            paused: body.paused,
+            perPlayCapCents: body.perPlayCapCents,
+            dailyCapCents: body.dailyCapCents,
+          });
+          const limits = effectiveLimits(game);
+          const said = wasPaused === game.pausedBySub
+            ? `${GAMES[key]} caps set to ${money(limits.perPlayCapCents)} a play and ${money(limits.dailyCapCents)} a day`
+            : `${GAMES[key]} ${game.pausedBySub ? 'paused' : 'resumed'}`;
+          pushEntry(sub, stampEntry({ kind: 'note', amountCents: 0, source: 'sub', note: said }, now));
+          return { sub: privateSub(sub, now) };
+        });
+      },
+      'POST /api/me/game/play': async () => {
+        limit(`play:${ip}`, 60, 60 * 1000);
+        const session = requireSub(data(), token, now);
+        const body = await readBody(req);
+        if (body.game !== 'slot') throw new HttpError(400, 'Only the slot machine is played from your side.');
+        const playId = playIdOf(body.playId);
+        return store.update((book) => {
+          const sub = findSub(book, session.subId);
+          const prior = priorPlay(sub, playId, 'slot');
+          if (prior) return { play: prior, replayed: true, sub: privateSub(sub, now) };
+          accrueSub(sub, now);
+          const game = sub.games.slot;
+          const odds = game ? slotOdds(game.terms, effectiveLimits(game).perPlayCapCents) : null;
+          assertPlayable({ sub, key: 'slot', maxChargeCents: odds?.maxChargeCents ?? 0, now, today: nyDate(now) });
+          const reels = drawSlot(game.terms);
+          const outcome = odds.outcomes[slotOutcomeIndex(game.terms, reels)];
+          const play = recordPlay(sub, {
+            id: playId,
+            game: 'slot',
+            version: game.version,
+            reels,
+            label: `${outcome.label} (${outcome.multiplierPct / 100}x)`,
+            multiplierPct: outcome.multiplierPct,
+            amountCents: outcome.chargeCents,
+          }, now);
+          return { play, replayed: false, sub: privateSub(sub, now) };
+        });
+      },
+      'POST /api/me/atm/pin': async () => {
+        limit(`atm-pin-set:${ip}`, 10, 15 * 60 * 1000);
+        const session = requireSub(data(), token, now);
+        const body = await readBody(req);
+        const pin = String(body.pin || '');
+        if (!/^\d{4}$/.test(pin)) throw new HttpError(400, 'The card PIN is exactly 4 digits.');
+        if (body.notMyBankPin !== true) throw new HttpError(400, 'Confirm this is not a real bank PIN.');
+        const secret = await hashSecret(pin);
+        return store.update((book) => {
+          const sub = findSub(book, session.subId);
+          Object.assign(sub.atm, { pinSalt: secret.salt, pinHash: secret.hash, pinFails: 0, lockedUntil: null, card: null });
+          pushEntry(sub, stampEntry({ kind: 'note', amountCents: 0, source: 'sub', note: 'ATM card PIN set' }, now));
+          return { sub: privateSub(sub, now) };
+        });
+      },
+      'POST /api/me/atm/load': async () => {
+        const session = requireSub(data(), token, now);
+        const body = await readBody(req);
+        const add = cents(body.addCents, LIMITS.minCheckoutCents, LIMITS.maxAtmCents, 'A reload');
+        return store.update((book) => {
+          const sub = findSub(book, session.subId);
+          const balance = sub.atm.loadedCents - sub.atm.withdrawnCents;
+          if (balance + add > LIMITS.maxAtmCents) {
+            throw new HttpError(400, `The ATM holds at most ${money(LIMITS.maxAtmCents)} at a time.`);
+          }
+          sub.atm.loadedCents += add;
+          pushEntry(sub, stampEntry({
+            kind: 'note',
+            amountCents: add,
+            source: 'sub',
+            note: `ATM loaded. Balance now ${money(balance + add)}`,
+          }, now));
+          return { sub: privateSub(sub, now) };
+        });
+      },
+      'POST /api/me/atm/lower': async () => {
+        const session = requireSub(data(), token, now);
+        const body = await readBody(req);
+        return store.update((book) => {
+          const sub = findSub(book, session.subId);
+          const balance = sub.atm.loadedCents - sub.atm.withdrawnCents;
+          const next = cents(body.balanceCents, 0, balance, 'The new balance');
+          sub.atm.loadedCents = sub.atm.withdrawnCents + next;
+          pushEntry(sub, stampEntry({
+            kind: 'note',
+            amountCents: next,
+            source: 'sub',
+            note: `ATM balance lowered to ${money(next)}`,
+          }, now));
+          return { sub: privateSub(sub, now) };
+        });
+      },
+      'POST /api/me/atm/freeze': async () => {
+        const session = requireSub(data(), token, now);
+        const body = await readBody(req);
+        return store.update((book) => {
+          const sub = findSub(book, session.subId);
+          sub.atm.frozen = Boolean(body.frozen);
+          if (sub.atm.frozen) sub.atm.card = null;
+          pushEntry(sub, stampEntry({
+            kind: 'note',
+            amountCents: 0,
+            source: 'sub',
+            note: sub.atm.frozen ? 'ATM frozen' : 'ATM unfrozen',
           }, now));
           return { sub: privateSub(sub, now) };
         });
@@ -725,19 +915,134 @@ export function createServer(options = {}) {
           return { sub: privateSub(sub, now) };
         });
       },
-      'POST /api/studio/purse-draw': async () => studioAmount(data, token, now, req, (sub, amount, text) => {
-        const room = sub.purseCapCents - sub.purseDrawnCents;
-        if (amount > room) throw new HttpError(400, `The purse has ${money(Math.max(room, 0))} left.`);
-        sub.purseDrawnCents += amount;
-        if (sub.debt?.status === 'active') {
+      'POST /api/studio/game': async () => {
+        requireStudio(data(), token, now);
+        const body = await readBody(req);
+        const key = gameKeyOf(body.game);
+        const terms = normalizeTerms(key, body.terms);
+        return store.update((book) => {
+          const sub = findSub(book, body.subId);
+          if (sub.games[key]) reviseGame(sub.games[key], terms, now);
+          else sub.games[key] = newGame(terms, now);
+          pushEntry(sub, stampEntry({
+            kind: 'proposal',
+            amountCents: 0,
+            source: 'domme',
+            note: `${GAMES[key]} terms proposed (version ${sub.games[key].version}). Nothing can be played until they are accepted.`,
+          }, now));
+          return { sub: privateSub(sub, now) };
+        });
+      },
+      'POST /api/studio/game/preview': async () => {
+        requireStudio(data(), token, now);
+        const body = await readBody(req);
+        const key = gameKeyOf(body.game);
+        const terms = normalizeTerms(key, body.terms);
+        return { odds: key === 'slot' ? slotOdds(terms, terms.perPlayCapCents) : atmOdds(terms) };
+      },
+      'POST /api/studio/atm/pin': async () => {
+        requireStudio(data(), token, now);
+        const body = await readBody(req);
+        const pinTry = String(body.pin || '');
+        if (!/^\d{4}$/.test(pinTry)) throw new HttpError(400, 'Type all 4 digits.');
+        const result = await store.update(async (book) => {
+          const sub = findSub(book, body.subId);
+          const atm = sub.atm;
+          if (!atm.pinHash) return { error: [400, 'He has not set a card PIN yet.'] };
+          if (atm.frozen) return { error: [423, 'He froze the ATM. The card will not go in.'] };
+          if (atmLocked(atm, now)) return { error: [423, `The card is locked until ${clockTime(atm.lockedUntil)}.`] };
+          const ok = await verifySecret(pinTry, atm.pinSalt, atm.pinHash);
+          if (!ok) {
+            atm.pinFails = (atm.pinFails || 0) + 1;
+            atm.card = null;
+            if (atm.pinFails >= LIMITS.atmPinTries) {
+              atm.pinFails = 0;
+              atm.lockedUntil = new Date(now.getTime() + LIMITS.atmLockMinutes * 60 * 1000).toISOString();
+              return { error: [423, `Wrong PIN ${LIMITS.atmPinTries} times. The card is locked for ${LIMITS.atmLockMinutes} minutes.`], sub: privateSub(sub, now) };
+            }
+            const left = LIMITS.atmPinTries - atm.pinFails;
+            return { error: [401, `Wrong PIN. ${left} ${left === 1 ? 'try' : 'tries'} left before the card locks.`], sub: privateSub(sub, now) };
+          }
+          const wrongTries = atm.pinFails || 0;
+          atm.pinFails = 0;
+          atm.card = {
+            token: newId(16),
+            wrongTries,
+            expires: new Date(now.getTime() + LIMITS.atmCardMinutes * 60 * 1000).toISOString(),
+          };
+          return { cardToken: atm.card.token, sub: privateSub(sub, now) };
+        });
+        if (result.error) throw new HttpError(...result.error);
+        return result;
+      },
+      'POST /api/studio/atm/eject': async () => {
+        requireStudio(data(), token, now);
+        const body = await readBody(req);
+        return store.update((book) => {
+          const sub = findSub(book, body.subId);
+          sub.atm.card = null;
+          return { sub: privateSub(sub, now) };
+        });
+      },
+      'POST /api/studio/atm/withdraw': async () => {
+        requireStudio(data(), token, now);
+        const body = await readBody(req);
+        const playId = playIdOf(body.playId);
+        const option = body.option;
+        if (!['amount', 'quick', 'skim', 'kick'].includes(option)) throw new HttpError(400, 'Pick an amount or a quick option.');
+        return store.update((book) => {
+          const sub = findSub(book, body.subId);
+          const prior = priorPlay(sub, playId, 'atm');
+          if (prior) return { play: prior, replayed: true, sub: privateSub(sub, now) };
+          const atm = sub.atm;
+          if (atm.frozen) throw new HttpError(423, 'He froze the ATM.');
+          if (atmLocked(atm, now)) throw new HttpError(423, `The card is locked until ${clockTime(atm.lockedUntil)}.`);
+          if (!atm.card || atm.card.token !== body.cardToken || Date.parse(atm.card.expires) <= now.getTime()) {
+            throw new HttpError(401, 'Insert the card and type the PIN first.');
+          }
+          const game = sub.games.atm;
+          const terms = game?.terms;
+          let worst = 0;
+          let label = '';
+          if (terms && option === 'amount') {
+            worst = cents(body.amountCents, LIMITS.minCheckoutCents, LIMITS.maxGamePlayCents, 'A withdrawal');
+            label = 'Withdrawal';
+          } else if (terms && option === 'quick') {
+            worst = terms.quickCents;
+            label = 'Fast cash';
+          } else if (terms && option === 'skim') {
+            worst = terms.skimMaxCents;
+            label = 'Surprise skim';
+          } else if (terms) {
+            worst = Math.max(...terms.kick.map((item) => item.amountCents));
+            label = 'Kicked it for a bonus';
+          }
           accrueSub(sub, now);
-          sub.debt.balanceCents += amount;
-          pushEntry(sub, stampEntry({ kind: 'purse_draw', amountCents: amount, purpose: 'debt', source: 'domme', note: text || 'Purse draw' }, now));
-        } else {
-          sub.askCents += amount;
-          pushEntry(sub, stampEntry({ kind: 'purse_draw', amountCents: amount, purpose: 'tribute', source: 'domme', note: text || 'Purse draw' }, now));
-        }
-      }),
+          assertPlayable({ sub, key: 'atm', maxChargeCents: worst, now, today: nyDate(now) });
+          const balance = atm.loadedCents - atm.withdrawnCents;
+          if (worst > balance) {
+            throw new HttpError(400, option === 'amount' || option === 'quick'
+              ? `The ATM only holds ${money(balance)}.`
+              : `This could take ${money(worst)}, and the ATM only holds ${money(balance)}. Pick an amount instead.`);
+          }
+          let amount = worst;
+          if (option === 'skim') amount = drawSkim(terms);
+          if (option === 'kick') amount = drawKick(terms);
+          atm.withdrawnCents += amount;
+          const play = recordPlay(sub, {
+            id: playId,
+            game: 'atm',
+            version: game.version,
+            option,
+            label,
+            amountCents: amount,
+            wrongTries: atm.card.wrongTries,
+            atmBalanceAfterCents: atm.loadedCents - atm.withdrawnCents,
+          }, now);
+          atm.card.wrongTries = 0;
+          return { play, replayed: false, sub: privateSub(sub, now) };
+        });
+      },
       'POST /api/studio/status': async () => {
         requireStudio(data(), token, now);
         const body = await readBody(req);
@@ -849,7 +1154,7 @@ export function createServer(options = {}) {
       const payload = await handler();
       send(res, 200, payload);
     } catch (error) {
-      const status = error instanceof HttpError ? error.status : 500;
+      const status = error instanceof HttpError || error instanceof GameError ? error.status : 500;
       if (status === 500) console.error('bijouxdebt', error instanceof Error ? error.message : 'error');
       send(res, status, { error: status === 500 ? 'The book could not do that.' : error.message });
     }
@@ -887,6 +1192,11 @@ function requireStudio(data, token, now) {
   const session = sessionFrom(data, token, now);
   if (!session || session.role !== 'studio') throw new HttpError(401, 'The studio is locked.');
   return session;
+}
+
+function clockTime(iso) {
+  return new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })
+    .format(new Date(iso));
 }
 
 async function presentInvoice(invoice) {

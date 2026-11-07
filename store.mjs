@@ -2,6 +2,7 @@ import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { upgradeSub } from './games.mjs';
 
 const scryptAsync = promisify(scrypt);
 
@@ -56,6 +57,7 @@ export function createStore(file) {
     if (!Array.isArray(data.subs)) data.subs = [];
     if (!Array.isArray(data.sessions)) data.sessions = [];
     if (!Array.isArray(data.invoices)) data.invoices = [];
+    for (const sub of data.subs) upgradeSub(sub);
   }
 
   async function persist() {
