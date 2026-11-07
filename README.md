@@ -10,7 +10,7 @@ It is a record, not a lender. A debt does not accrue until that person signs the
 
 - A signed debt: principal, yearly interest posted each New York morning, a due day from the 1st to the 28th, a minimum, and one late fee the morning after a missed due date.
 - A tribute total, and a hall of confirmed payments.
-- Claims for money sent somewhere else. She confirms or rejects them.
+- Claims for money sent somewhere else. She confirms or rejects them. Each claim needs a transaction ID, a screenshot of the payment, or both. Screenshots are PNG or JPEG up to 3 MB, stripped of camera and text metadata, and shown only to her and the name that sent them. They are saved in `data/proofs/`, so back up the whole `data/` folder, not just the book.
 - A self-charge, which can only increase a signed debt.
 - Tasks with a penalty she decides.
 - Games that decide an amount owed. Every result is a charge added to an active signed debt. A game never pays out, refunds, lowers a balance, or clears a debt, and none can be played without an active debt. The best outcome is the smallest charge.
@@ -19,6 +19,7 @@ It is a record, not a lender. A debt does not accrue until that person signs the
   - He accepts a game's terms before the first play. Any change she makes sends it back for him to accept again.
   - She sets a per-play cap, a daily cap (New York day), and a cooldown, all under hard ceilings in `ledger.mjs`. He can pause a game or lower his own caps at any time.
   - Each play writes a `game` line into the feed both sides see.
+  - Her payment rules decide who can play. She can hold all games for a name, lock them while a minimum payment is missed, keep them locked until a set amount is paid, and lock them once unpaid game charges reach a limit. Only real money counts: Lightning that settled, payments she records, and claims she confirms. A sample checkout never does. A lock stops slot spins and ATM withdrawals alike, and both pages say why.
 - A slot machine per name: three reels, symbols and weights, a stake, and a payout table of multipliers that she sets.
 - A Human ATM, which replaces the old purse. He loads it, and that balance is the most she can withdraw until he reloads. He can reload, lower it down to zero, or freeze it at any time. He sets a 4-digit card PIN for role-play only, stored with scrypt and never shown. She inserts the card, types the PIN, and withdraws an amount, fast cash, a surprise skim, or a kick for a bonus. Three wrong PINs lock the card for 15 minutes. His page shows the machine live, and replays each withdrawal from the saved log.
 - Tiers on the public page that open checkout.
