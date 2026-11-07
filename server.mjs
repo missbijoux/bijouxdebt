@@ -1281,7 +1281,7 @@ async function serveStatic(pathname, res, base) {
       return;
     }
     const ext = path.extname(file);
-    const types = { '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml' };
+    const types = { '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.woff2': 'font/woff2' };
     if (!types[ext]) {
       send(res, 404, { error: 'Not found.' });
       return;
