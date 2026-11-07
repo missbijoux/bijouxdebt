@@ -13,10 +13,19 @@ It is a record, not a lender. A debt does not accrue until that person signs the
 - Claims for money sent somewhere else. She confirms or rejects them.
 - A self-charge, which can only increase a signed debt.
 - Tasks with a penalty she decides.
-- A purse. He sets the ceiling. She cannot draw past it.
+- Games that decide an amount owed. Every result is a charge added to an active signed debt. A game never pays out, refunds, lowers a balance, or clears a debt, and none can be played without an active debt. The best outcome is the smallest charge.
+  - The server draws every result with `crypto.randomInt` and saves it before answering. Each play carries its own id, so a retry, double-click, or refresh returns the saved play instead of drawing again. The browser only animates it.
+  - He sees the exact odds of every outcome and the average charge per play. She can make them as unfair as she likes, and the page says so plainly.
+  - He accepts a game's terms before the first play. Any change she makes sends it back for him to accept again.
+  - She sets a per-play cap, a daily cap (New York day), and a cooldown, all under hard ceilings in `ledger.mjs`. He can pause a game or lower his own caps at any time.
+  - Each play writes a `game` line into the feed both sides see.
+- A slot machine per name: three reels, symbols and weights, a stake, and a payout table of multipliers that she sets.
+- A Human ATM, which replaces the old purse. He loads it, and that balance is the most she can withdraw until he reloads. He can reload, lower it down to zero, or freeze it at any time. He sets a 4-digit card PIN for role-play only, stored with scrypt and never shown. She inserts the card, types the PIN, and withdraws an amount, fast cash, a surprise skim, or a kick for a bonus. Three wrong PINs lock the card for 15 minutes. His page shows the machine live, and replays each withdrawal from the saved log.
 - Tiers on the public page that open checkout.
 
-Payments are capped at $2,000 each. Interest is capped at 120% a year. The book does not include games of chance.
+Payments are capped at $2,000 each. Interest is capped at 120% a year.
+
+If the Lightning node does not answer, checkout gives up within 10 seconds and shows the error next to the form.
 
 ## Run
 

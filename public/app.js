@@ -14,6 +14,24 @@ const KIND = {
   forgive: 'Forgiven',
   settled: 'Settled',
   note: 'Note',
+  game: 'Game',
+};
+
+const SYMBOLS = {
+  gem: '◆',
+  ring: '◯',
+  pearl: '●',
+  heart: '♥\uFE0E',
+  lock: '⊠',
+  crown: '♛',
+  star: '★',
+  rose: '✿',
+};
+
+const GAME_STATUS = {
+  proposed: 'Waiting for acceptance',
+  ready: 'Accepted',
+  paused: 'Paused by him',
 };
 
 const state = {
@@ -24,8 +42,16 @@ const state = {
   studio: null,
   invoice: null,
   error: '',
+  formError: null,
   notice: '',
   poll: 0,
+  live: 0,
+  liveSig: '',
+  spin: { busy: false, stopped: 0 },
+  replaying: false,
+  replayQueue: [],
+  atm: {},
+  preview: {},
 };
 
 try {
@@ -97,6 +123,100 @@ function field(label, control) {
   return el('label', null, el('span', null, label), control);
 }
 
+function errorSlot(key) {
+  if (state.formError?.key !== key) return null;
+  return el('p', { class: 'error form-error', role: 'alert' }, state.formError.message);
+}
+
+function form(key, action, ...children) {
+  return formWith(key, null, action, ...children);
+}
+
+function formWith(key, attrs, action, ...children) {
+  return el('form', { ...attrs, 'data-form': key, onsubmit: (event) => submit(event, action) }, ...children, errorSlot(key));
+}
+
+/** Re-rendering rebuilds every form, so put back what was typed when the same form comes back. */
+function keepValues(formNode) {
+  const key = formNode.getAttribute('data-form');
+  const saved = [...formNode.elements].map((node) => [node.name, node.type === 'checkbox' ? node.checked : node.value]);
+  return () => {
+    const next = key && document.querySelector(`form[data-form="${key}"]`);
+    if (!next || next.elements.length !== saved.length) return;
+    [...next.elements].forEach((node, index) => {
+      const [name, value] = saved[index];
+      if (!name || node.name !== name || node.type === 'password') return;
+      if (node.type === 'checkbox') node.checked = value;
+      else node.value = value;
+    });
+  };
+}
+
+function revealError() {
+  document.querySelector('.form-error, .error')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+async function press(key, action) {
+  state.error = '';
+  state.formError = null;
+  try {
+    await action();
+  } catch (error) {
+    state.formError = { key, message: error.message };
+    render();
+    revealError();
+  }
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function reducedMotion() {
+  return Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)').matches);
+}
+
+function clock(iso) {
+  return new Date(iso).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+}
+
+function dollars(cents) {
+  return (cents / 100).toFixed(2);
+}
+
+function randomHex(bytes = 16) {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return [...buf].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/** One id per intended play, kept until the server answers, so a retry or refresh returns the saved result. */
+const heldPlays = {};
+
+function pendingPlayId(name) {
+  try {
+    const saved = sessionStorage.getItem(`bijouxdebt-play-${name}`);
+    if (saved) return saved;
+  } catch { /* storage blocked; the id is held in memory */ }
+  heldPlays[name] ||= randomHex();
+  try { sessionStorage.setItem(`bijouxdebt-play-${name}`, heldPlays[name]); } catch { /* held in memory */ }
+  return heldPlays[name];
+}
+
+function hasPendingPlay(name) {
+  if (heldPlays[name]) return true;
+  try {
+    return Boolean(sessionStorage.getItem(`bijouxdebt-play-${name}`));
+  } catch {
+    return false;
+  }
+}
+
+function clearPendingPlay(name) {
+  delete heldPlays[name];
+  try { sessionStorage.removeItem(`bijouxdebt-play-${name}`); } catch { /* nothing saved */ }
+}
+
 function banner() {
   const blocks = [];
   if (state.pub?.checkout === 'sandbox') {
@@ -116,6 +236,7 @@ function shell(current, ...main) {
       link('/', 'The book'),
       link('/join', 'Open a name'),
       link('/book', state.sub ? state.sub.handle : 'My book'),
+      link('/games', 'Games'),
       link('/studio', 'Studio'),
       el('a', { class: 'site-link', href: 'https://mistressbijoux.com', rel: 'noopener noreferrer' }, 'mistressbijoux.com'),
     ),
@@ -139,9 +260,9 @@ function home() {
       el('a', { class: 'btn', href: '#/join' }, 'Open a name'),
       el('a', { class: 'btn secondary', href: '#/book' }, 'Return to your book'),
     ),
-    el('h2', { style: 'margin-top:36px' }, 'Tiers'),
+    el('h2', { class: 'spaced' }, 'Tiers'),
     el('div', { class: 'grid cards' }, ...(pub?.tiers || []).map(tierCard)),
-    el('h2', { id: 'hall', style: 'margin-top:36px' }, 'Hall'),
+    el('h2', { id: 'hall', class: 'spaced' }, 'Hall'),
     hall(pub),
     foot(),
   );
@@ -173,7 +294,11 @@ function startTier(tier) {
   } catch { /* the book still opens if storage is blocked */ }
   if (state.role === 'sub') {
     location.hash = '#/book';
-    consumePending();
+    consumePending().catch((error) => {
+      state.error = error.message;
+      render();
+      revealError();
+    });
     return;
   }
   location.hash = '#/join';
@@ -202,14 +327,14 @@ function join() {
     el('p', { class: 'kicker' }, 'A name in the book'),
     el('h1', null, 'Open a name'),
     el('div', { class: 'grid split' },
-      el('form', { class: 'panel', onsubmit: (event) => submit(event, createName) },
+      formWith('join', { class: 'panel' }, createName,
         field('Name', el('input', { name: 'handle', required: true, minlength: 3, maxlength: 20, autocomplete: 'username', pattern: '[A-Za-z0-9_]{3,20}' })),
         field('Title', el('select', { name: 'title' }, ...(state.pub?.titles || ['sub']).map((title) => el('option', { value: title }, title)))),
         field('Passphrase', el('input', { name: 'passphrase', type: 'password', required: true, minlength: 8, maxlength: 72, autocomplete: 'new-password' })),
         field('Age', el('span', { class: 'row' }, el('input', { name: 'adult', type: 'checkbox', required: true }), 'I am 18 or older.')),
         el('button', { class: 'btn', type: 'submit' }, 'Open my book'),
       ),
-      el('form', { class: 'panel', onsubmit: (event) => submit(event, enterName) },
+      formWith('enter', { class: 'panel' }, enterName,
         el('h2', null, 'Already opened'),
         field('Name', el('input', { name: 'handle', required: true, autocomplete: 'username' })),
         field('Passphrase', el('input', { name: 'passphrase', type: 'password', required: true, autocomplete: 'current-password' })),
@@ -282,7 +407,7 @@ function book() {
       figure('Debt', debt ? money(debt.balanceCents) : 'None', debt ? debt.status : 'No debt has been written'),
       figure('Tribute', money(sub.tributeCents), 'Recorded as tribute'),
       figure('Sent', money(sub.sentCents), 'Everything confirmed'),
-      figure('Waiting', money(sub.askCents), `Purse left ${money(Math.max(sub.purseCapCents - sub.purseDrawnCents, 0))}`),
+      figure('Waiting', money(sub.askCents), `ATM holds ${money(sub.atm.balanceCents)}`),
     ),
     debtPanel(debt),
     invoicePanel(),
@@ -291,7 +416,7 @@ function book() {
         el('h2', null, 'Pay or claim'),
         payForm('Pay the debt', 'debt', Boolean(debt && debt.status === 'active')),
         payForm('Send tribute', 'tribute', true),
-        el('form', { onsubmit: (event) => submit(event, claimPayment) },
+        form('claim', claimPayment,
           el('h3', null, 'Claim a payment made elsewhere'),
           field('Amount', el('input', { name: 'amount', inputmode: 'decimal', required: true, placeholder: '0.00' })),
           field('Toward', el('select', { name: 'purpose' }, el('option', { value: 'debt' }, 'Debt'), el('option', { value: 'tribute' }, 'Tribute'))),
@@ -301,19 +426,18 @@ function book() {
       ),
       el('section', { class: 'panel' },
         el('h2', null, 'Your side of the book'),
-        el('form', { onsubmit: (event) => submit(event, selfCharge) },
+        form('self-charge', selfCharge,
           el('h3', null, 'Add to the debt'),
           field('Amount', el('input', { name: 'amount', inputmode: 'decimal', required: true })),
           field('What you are adding', el('input', { name: 'note', required: true, maxlength: 140 })),
           el('button', { class: 'btn secondary', type: 'submit' }, 'Add it'),
         ),
-        el('form', { onsubmit: (event) => submit(event, setPurse) },
-          el('h3', null, 'Purse ceiling'),
-          el('p', { class: 'muted' }, 'She can draw up to this amount and no further. Lowering it cannot erase a draw she already took.'),
-          field('Ceiling', el('input', { name: 'amount', inputmode: 'decimal', required: true, value: (sub.purseCapCents / 100).toFixed(2) })),
-          el('button', { class: 'btn secondary', type: 'submit' }, 'Set the ceiling'),
+        el('div', null,
+          el('h3', null, 'Games and the Human ATM'),
+          el('p', { class: 'muted' }, `The ATM holds ${money(sub.atm.balanceCents)}. She can withdraw that much and no more until you reload it.${sub.atm.frozen ? ' It is frozen.' : ''}`),
+          el('a', { class: 'btn secondary', href: '#/games' }, 'Open games'),
         ),
-        el('form', { onsubmit: (event) => submit(event, toggleHall) },
+        form('hall', toggleHall,
           field('Hall', el('span', { class: 'row' }, el('input', { name: 'hide', type: 'checkbox', checked: sub.hideFromHall ? true : null }), 'Hide my name from the hall')),
           el('button', { class: 'btn secondary', type: 'submit' }, 'Save'),
         ),
@@ -347,7 +471,7 @@ function debtPanel(debt) {
 
 function payForm(title, purpose, enabled) {
   if (!enabled) return el('p', { class: 'muted' }, `${title} opens after the debt is signed.`);
-  return el('form', { onsubmit: (event) => submit(event, (formEvent) => checkoutAmount(formEvent, purpose)) },
+  return form(`pay-${purpose}`, (event) => checkoutAmount(event, purpose),
     el('h3', null, title),
     field('Amount', el('input', { name: 'amount', inputmode: 'decimal', required: true, placeholder: '0.00' })),
     el('button', { class: 'btn', type: 'submit' }, 'Checkout'),
@@ -402,7 +526,7 @@ function feed(sub) {
     el('h2', null, 'The lines'),
     lines.length ? el('ol', { class: 'feed' }, lines.map((entry) => el('li', null,
       el('span', null, `${prettyDay(entry.nyDay)} · ${KIND[entry.kind] || entry.kind} · ${entry.note || ''}${entry.status === 'confirmed' ? '' : ` · ${entry.status}`}`),
-      el('strong', null, money(entry.amountCents)),
+      entry.amountCents ? el('strong', null, money(entry.amountCents)) : null,
     ))) : el('p', { class: 'muted' }, 'No lines yet.'),
   );
 }
@@ -413,11 +537,16 @@ function studio() {
       ...banner(),
       el('p', { class: 'kicker' }, 'Private'),
       el('h1', null, 'Studio'),
-      el('form', { class: 'panel', onsubmit: (event) => submit(event, studioLogin) },
+      formWith('studio-login', { class: 'panel' }, studioLogin,
         field('Studio pin', el('input', { name: 'pin', type: 'password', required: true, autocomplete: 'current-password' })),
         el('button', { class: 'btn', type: 'submit' }, 'Unlock'),
       ),
     );
+    return;
+  }
+  const gamesFor = route().match(/^\/studio\/games\/([a-f0-9]+)$/);
+  if (gamesFor) {
+    studioGames(gamesFor[1]);
     return;
   }
   const book = state.studio;
@@ -437,7 +566,7 @@ function studio() {
 }
 
 function tierEditor(book) {
-  return el('form', { class: 'panel', onsubmit: (event) => submit(event, saveTiers) },
+  return formWith('tiers', { class: 'panel' }, saveTiers,
     el('h2', null, 'Tiers'),
     ...(book.tiers || []).map((tier) => el('div', { 'data-tier': tier.id, class: 'grid cards' },
       field('Name', el('input', { name: 'name', value: tier.name, required: true })),
@@ -453,8 +582,12 @@ function studioCard(sub) {
   return el('details', { class: 'panel', open: true },
     el('summary', null, `${sub.handle} · ${sub.title} · sent ${money(sub.sentCents)} · debt ${debt ? money(debt.balanceCents) : 'none'}`),
     debt ? el('p', null, `Status ${debt.status}. ${debt.apr}% · due day ${debt.dueDay} · late fee ${money(debt.lateFeeCents)} · minimum ${money(debt.minPaymentCents)}.`) : el('p', { class: 'muted' }, 'No debt yet.'),
-    el('p', { class: 'muted' }, `Ask ${money(sub.askCents)}. Purse ${money(sub.purseDrawnCents)} of ${money(sub.purseCapCents)}. This month ${money(sub.monthCents)}.`),
-    el('form', { onsubmit: (event) => submit(event, (formEvent) => proposeDebt(formEvent, sub.id)) },
+    el('p', { class: 'muted' }, `Ask ${money(sub.askCents)}. ATM ${money(sub.atm.balanceCents)} left of ${money(sub.atm.loadedCents)} loaded${sub.atm.frozen ? ', frozen' : ''}. This month ${money(sub.monthCents)}.`),
+    el('p', { class: 'row' },
+      el('a', { class: 'btn secondary', href: `#/studio/games/${sub.id}` }, 'Slot machine and ATM'),
+      el('span', { class: 'muted' }, `Slot: ${sub.games.slot ? GAME_STATUS[sub.games.slot.status].toLowerCase() : 'not set up'}. ATM: ${sub.games.atm ? GAME_STATUS[sub.games.atm.status].toLowerCase() : 'no terms yet'}.`),
+    ),
+    form(`debt-${sub.id}`, (event) => proposeDebt(event, sub.id),
       el('h3', null, 'Write a debt'),
       field('Principal', el('input', { name: 'principal', required: true, placeholder: '500.00' })),
       field('Interest % per year', el('input', { name: 'apr', required: true, value: '0' })),
@@ -469,26 +602,20 @@ function studioCard(sub) {
       el('button', { class: 'btn secondary', type: 'button', onclick: () => debtAction(sub.id, 'settle') }, 'Settle'),
       el('button', { class: 'btn danger', type: 'button', onclick: () => debtAction(sub.id, 'forgive') }, 'Forgive and stop'),
     ) : null,
-    el('form', { onsubmit: (event) => submit(event, (formEvent) => studioMoney(formEvent, '/api/studio/charge', sub.id)) },
+    form(`charge-${sub.id}`, (event) => studioMoney(event, '/api/studio/charge', sub.id),
       el('h3', null, 'Add a charge'),
       field('Amount', el('input', { name: 'amount', required: true })),
       field('Note', el('input', { name: 'note', maxlength: 140 })),
       el('button', { class: 'btn secondary', type: 'submit' }, 'Charge'),
     ),
-    el('form', { onsubmit: (event) => submit(event, (formEvent) => recordPayment(formEvent, sub.id)) },
+    form(`payment-${sub.id}`, (event) => recordPayment(event, sub.id),
       el('h3', null, 'Record a payment you already received'),
       field('Amount', el('input', { name: 'amount', required: true })),
       field('Toward', el('select', { name: 'purpose' }, el('option', { value: 'debt' }, 'Debt'), el('option', { value: 'tribute' }, 'Tribute'))),
       field('Note', el('input', { name: 'note', maxlength: 140 })),
       el('button', { class: 'btn secondary', type: 'submit' }, 'Record it'),
     ),
-    el('form', { onsubmit: (event) => submit(event, (formEvent) => studioMoney(formEvent, '/api/studio/purse-draw', sub.id)) },
-      el('h3', null, 'Draw the purse'),
-      field('Amount', el('input', { name: 'amount', required: true })),
-      field('Note', el('input', { name: 'note', maxlength: 140 })),
-      el('button', { class: 'btn secondary', type: 'submit' }, 'Draw'),
-    ),
-    el('form', { onsubmit: (event) => submit(event, (formEvent) => createTask(formEvent, sub.id)) },
+    form(`task-${sub.id}`, (event) => createTask(event, sub.id),
       el('h3', null, 'Give a task'),
       field('Title', el('input', { name: 'title', required: true, maxlength: 80 })),
       field('Detail', el('input', { name: 'detail', maxlength: 280 })),
@@ -525,13 +652,19 @@ function verdicts(sub) {
 async function submit(event, action) {
   event.preventDefault();
   state.error = '';
+  state.formError = null;
+  const key = event.target.getAttribute('data-form');
+  const restore = keepValues(event.target);
   const button = event.submitter;
   if (button) button.disabled = true;
   try {
-    await action(event);
+    await action(event, restore);
   } catch (error) {
-    state.error = error.message;
+    if (key) state.formError = { key, message: error.message };
+    else state.error = error.message;
     render();
+    restore();
+    revealError();
   }
 }
 
@@ -555,6 +688,11 @@ async function signDebt() {
 
 async function checkoutAmount(event, purpose) {
   const amountCents = dollarsToCents(new FormData(event.target).get('amount'));
+  const button = event.submitter;
+  if (button) {
+    button.textContent = 'Creating invoice…';
+    button.setAttribute('aria-busy', 'true');
+  }
   state.invoice = await api('/api/checkout', { method: 'POST', body: { amountCents, purpose } });
   watchInvoice(state.invoice.id);
   state.notice = state.invoice.sample ? 'Sample invoice ready.' : 'Invoice ready.';
@@ -617,11 +755,6 @@ async function selfCharge(event) {
     method: 'POST',
     body: { amountCents: dollarsToCents(data.amount), note: data.note },
   }));
-}
-
-async function setPurse(event) {
-  const data = Object.fromEntries(new FormData(event.target));
-  await refreshSub(await api('/api/me/purse', { method: 'POST', body: { capCents: dollarsToCents(data.amount) } }));
 }
 
 async function toggleHall(event) {
@@ -770,6 +903,784 @@ async function debtAction(subId, action) {
   }
 }
 
+function chance(item) {
+  return item.exact ? `${item.percent}%` : `${item.percent}% (exactly ${item.fraction.replace('/', ' in ')})`;
+}
+
+function averageText(average) {
+  if (average.numerator % average.denominator === 0) return money(average.cents);
+  return `${money(average.cents)} (exactly ${average.fraction} cents)`;
+}
+
+function duration(seconds) {
+  if (seconds < 120) return `${seconds} seconds`;
+  if (seconds < 7200) return `${Math.round(seconds / 60)} minutes`;
+  return `${Math.round(seconds / 360) / 10} hours`;
+}
+
+function limitsLine(game, unit) {
+  const own = game.subLimits?.perPlayCapCents != null || game.subLimits?.dailyCapCents != null;
+  return `Up to ${money(game.limits.perPlayCapCents)} a ${unit} and ${money(game.limits.dailyCapCents)} a New York day, one ${unit} every ${duration(game.limits.cooldownSeconds)}.${own ? ' Includes caps he lowered himself.' : ''}`;
+}
+
+function table(head, rows) {
+  return el('table', { class: 'odds-table' },
+    el('thead', null, el('tr', null, ...head.map((cell) => el('th', { scope: 'col' }, cell)))),
+    el('tbody', null, ...rows.map((row) => el('tr', null, ...row.map((cell) => el('td', null, cell))))),
+  );
+}
+
+function slotTerms(game) {
+  const odds = game.odds;
+  return el('div', { class: 'odds' },
+    el('p', { class: 'rigged' }, odds.rigged),
+    el('p', null, `Stake ${money(odds.stakeCents)}. Every spin adds to the signed debt. Nothing pays out and nothing comes off: the best result is the smallest charge.`),
+    table(['Outcome', 'Chance', 'Adds to the debt'], odds.outcomes.map((item) => [
+      item.label,
+      chance(item),
+      `${money(item.chargeCents)} (${item.multiplierPct / 100}x${item.capped ? ', held to the cap' : ''})`,
+    ])),
+    el('p', null, el('strong', null, `Average charge per spin: ${averageText(odds.average)}.`)),
+    el('p', { class: 'muted' }, `Each reel lands on ${odds.reels.map((reel) => `${SYMBOLS[reel.id]} ${reel.id} ${chance(reel)}`).join(', ')}.`),
+    el('p', { class: 'muted' }, limitsLine(game, 'spin')),
+  );
+}
+
+function atmTerms(game) {
+  const odds = game.odds;
+  return el('div', { class: 'odds' },
+    el('p', { class: 'rigged' }, odds.rigged),
+    el('p', null, 'Every withdrawal adds to the signed debt and comes off the loaded balance. Nothing is paid back.'),
+    table(['Option', 'Chance', 'Adds to the debt'], [
+      ['Her pick', 'She types the amount', `${money(100)} to ${money(game.limits.perPlayCapCents)}`],
+      ['Fast cash', '100%', money(odds.quick.amountCents)],
+      ['Surprise skim', `Every cent from ${money(odds.skim.minCents)} to ${money(odds.skim.maxCents)} equally likely`, `Average ${averageText(odds.skim.average)}`],
+      ...odds.kick.outcomes.map((item) => ['Kick it for a bonus', chance(item), money(item.amountCents)]),
+    ]),
+    el('p', null, el('strong', null, `Average kick: ${averageText(odds.kick.average)}. Average skim: ${averageText(odds.skim.average)}.`)),
+    el('p', { class: 'muted' }, limitsLine(game, 'withdrawal')),
+  );
+}
+
+function acceptPanel(game, terms) {
+  const key = `${game.key}-accept`;
+  return el('div', { class: 'accept' },
+    el('p', null, el('span', { class: 'tag' }, game.acceptedVersion ? `Changed · version ${game.version}` : `Proposed · version ${game.version}`)),
+    el('p', null, game.acceptedVersion
+      ? 'She changed the terms. Nothing can be played until you read them and accept again.'
+      : 'Read the terms first. Nothing can be played until you accept them.'),
+    terms,
+    el('div', { class: 'row' },
+      el('button', { class: 'btn', type: 'button', onclick: () => press(key, () => acceptTerms(game)) }, 'I accept these terms'),
+    ),
+    errorSlot(key),
+  );
+}
+
+function subLimitsForm(game, unit) {
+  const key = `${game.key}-limits`;
+  const own = game.subLimits;
+  return form(key, (event) => saveGameCaps(event, game.key),
+    el('h3', null, 'Your limits'),
+    el('p', { class: 'muted' }, `Pause or lower these any time. Her caps are ${money(game.terms.perPlayCapCents)} a ${unit} and ${money(game.terms.dailyCapCents)} a day. Leave a box empty to use hers.`),
+    el('div', { class: 'row' },
+      el('button', { class: 'btn secondary', type: 'button', onclick: () => press(key, () => setGameLimits(game.key, { paused: !game.pausedBySub })) },
+        game.pausedBySub ? 'Resume this game' : 'Pause this game'),
+    ),
+    el('div', { class: 'grid cards' },
+      field(`Most per ${unit}`, el('input', { name: 'perPlay', inputmode: 'decimal', placeholder: dollars(game.terms.perPlayCapCents), value: own.perPlayCapCents == null ? '' : dollars(own.perPlayCapCents) })),
+      field('Most per day', el('input', { name: 'daily', inputmode: 'decimal', placeholder: dollars(game.terms.dailyCapCents), value: own.dailyCapCents == null ? '' : dollars(own.dailyCapCents) })),
+    ),
+    el('button', { class: 'btn secondary', type: 'submit' }, 'Save my limits'),
+  );
+}
+
+function playList(game, replay) {
+  if (!game.plays.length) return null;
+  return el('div', null,
+    el('h3', null, game.key === 'slot' ? 'Recent spins' : 'Withdrawals'),
+    el('ol', { class: 'feed' }, [...game.plays].reverse().map((play) => el('li', null,
+      el('span', null,
+        `${prettyDay(play.nyDay)} ${clock(play.at)} · `,
+        play.reels ? `${play.reels.map((id) => SYMBOLS[id]).join(' ')} · ` : '',
+        play.label,
+        play.atmBalanceAfterCents != null ? ` · ATM left ${money(play.atmBalanceAfterCents)}` : '',
+        ` · debt ${money(play.balanceAfterCents)}`,
+      ),
+      el('span', { class: 'row' },
+        el('strong', null, `+${money(play.amountCents)}`),
+        replay ? el('button', { class: 'btn secondary small-btn', type: 'button', onclick: () => replayOnDemand(play) }, 'Replay') : null,
+      ),
+    ))),
+  );
+}
+
+function games() {
+  if (state.role !== 'sub' || !state.sub) {
+    shell('/games', ...banner(), el('h1', null, 'Games'), el('p', { class: 'lede' }, 'Open your name to see the games she set up for you.'), el('a', { class: 'btn', href: '#/join' }, 'Open a name'));
+    return;
+  }
+  const sub = state.sub;
+  const debt = sub.debt;
+  state.liveSig = JSON.stringify(sub);
+  shell('/games',
+    ...banner(),
+    el('p', { class: 'kicker' }, sub.handle),
+    el('h1', null, 'Games'),
+    el('p', { class: 'lede' }, 'Every result adds to your signed debt. Nothing pays out and nothing comes off. The best you can do is the smallest charge.'),
+    el('div', { class: 'grid cards' },
+      figure('Debt', debt ? money(debt.balanceCents) : 'None', debt?.status === 'active' ? 'Games add here' : 'Games need an active signed debt'),
+      figure('ATM', money(sub.atm.balanceCents), sub.atm.frozen ? 'Frozen' : `Loaded ${money(sub.atm.loadedCents)} in all`),
+    ),
+    slotPanel(sub),
+    atmPanel(sub),
+  );
+  watchLive();
+}
+
+function slotPanel(sub) {
+  const game = sub.games.slot;
+  if (!game) {
+    return el('section', { class: 'panel', id: 'slot' }, el('h2', null, 'Slot machine'), el('p', { class: 'muted' }, 'She has not set up a slot machine for you.'));
+  }
+  if (game.status === 'proposed') {
+    return el('section', { class: 'panel', id: 'slot' }, el('h2', null, 'Slot machine'), acceptPanel(game, slotTerms(game)));
+  }
+  const last = game.plays.at(-1);
+  const cooling = game.nextPlayAt && Date.parse(game.nextPlayAt) > Date.now();
+  let blocked = '';
+  if (sub.debt?.status !== 'active') blocked = 'Games only add to an active signed debt, and none is running.';
+  else if (game.pausedBySub) blocked = 'You paused this game.';
+  else if (cooling) blocked = `Cooling down until ${clock(game.nextPlayAt)}.`;
+  else if (game.leftTodayCents < game.odds.maxChargeCents) blocked = `Today's cap is reached. ${money(game.leftTodayCents)} is left, and a spin can cost ${money(game.odds.maxChargeCents)}.`;
+  const pending = hasPendingPlay('slot');
+  return el('section', { class: 'panel', id: 'slot' },
+    el('h2', null, 'Slot machine'),
+    el('p', { class: 'rigged' }, game.odds.rigged),
+    el('div', { class: 'slot' },
+      el('div', { class: 'reels', id: 'reels' }, ...[0, 1, 2].map((index) => reel(game, last, index))),
+      el('p', { class: 'slot-result', id: 'slot-result', 'aria-live': 'polite' }, state.spin.busy
+        ? 'Spinning…'
+        : last ? `${last.label}. ${money(last.amountCents)} added to your debt.` : 'No spins yet.'),
+      el('button', {
+        class: 'btn spin',
+        type: 'button',
+        disabled: state.spin.busy || (Boolean(blocked) && !pending),
+        onclick: spin,
+      }, state.spin.busy ? 'Spinning…' : pending ? 'Finish the last spin' : `Spin · ${money(game.odds.stakeCents)} stake`),
+      blocked && !state.spin.busy ? el('p', { class: 'muted' }, blocked) : null,
+      el('p', { class: 'muted' }, `Today ${money(game.todayCents)} of ${money(game.limits.dailyCapCents)}. Average charge per spin ${averageText(game.odds.average)}.`),
+      errorSlot('slot-play'),
+    ),
+    el('details', null, el('summary', null, 'Exact odds and terms'), slotTerms(game)),
+    subLimitsForm(game, 'spin'),
+    playList(game, false),
+  );
+}
+
+function reel(game, play, index) {
+  if (state.spin.busy && state.spin.stopped <= index) {
+    const strip = [...game.terms.symbols, ...game.terms.symbols].map((symbol) => el('span', null, SYMBOLS[symbol.id]));
+    return el('div', { class: `reel spinning r${index + 1}`, 'aria-hidden': 'true' }, el('div', { class: 'strip' }, ...strip));
+  }
+  const id = play?.reels?.[index] || game.terms.symbols[index % game.terms.symbols.length].id;
+  return el('div', { class: state.spin.busy ? 'reel landed' : 'reel' },
+    el('span', { class: 'symbol' }, SYMBOLS[id]),
+    el('span', { class: 'name' }, id),
+  );
+}
+
+async function spin() {
+  if (state.spin.busy) return;
+  const game = state.sub.games.slot;
+  const id = pendingPlayId('slot');
+  state.error = '';
+  state.formError = null;
+  state.spin = { busy: true, stopped: 0 };
+  render();
+  const started = Date.now();
+  const fast = reducedMotion();
+  try {
+    const result = await api('/api/me/game/play', { method: 'POST', body: { game: 'slot', playId: id } });
+    clearPendingPlay('slot');
+    await wait(Math.max(0, (fast ? 0 : 1100) - (Date.now() - started)));
+    for (let index = 0; index < 3; index += 1) {
+      state.spin.stopped = index + 1;
+      document.querySelectorAll('#reels .reel')[index]?.replaceWith(reel(game, result.play, index));
+      await wait(fast ? 0 : 450);
+    }
+    state.sub = result.sub;
+  } catch (error) {
+    state.formError = { key: 'slot-play', message: error.message };
+  }
+  state.spin = { busy: false, stopped: 0 };
+  render();
+  if (state.formError) revealError();
+}
+
+function atmPanel(sub) {
+  const atm = sub.atm;
+  const game = sub.games.atm;
+  let terms = el('p', { class: 'muted' }, 'She has not set the ATM terms yet. You can load it and set a card PIN now.');
+  if (game?.status === 'proposed') terms = acceptPanel(game, atmTerms(game));
+  else if (game) terms = el('details', null, el('summary', null, 'Exact odds and terms'), atmTerms(game));
+  return el('section', { class: 'panel', id: 'atm' },
+    el('h2', null, 'Human ATM'),
+    el('p', { class: 'muted' }, 'You load it. She inserts your card, types your PIN, and withdraws, never past what is loaded or the caps. Every withdrawal adds to your signed debt.'),
+    atmLive(sub),
+    terms,
+    el('div', { class: 'grid split' },
+      el('div', null,
+        form('atm-load', loadAtm,
+          el('h3', null, 'Load or reload'),
+          el('p', { class: 'muted' }, 'This is the most she can withdraw until you reload.'),
+          field('Add', el('input', { name: 'amount', inputmode: 'decimal', required: true, placeholder: '50.00' })),
+          el('button', { class: 'btn', type: 'submit' }, 'Load it'),
+        ),
+        form('atm-lower', lowerAtm,
+          el('h3', null, 'Lower the balance'),
+          el('p', { class: 'muted' }, 'Down to zero at most. What she already withdrew stays withdrawn.'),
+          field('New balance', el('input', { name: 'amount', inputmode: 'decimal', required: true, value: dollars(atm.balanceCents) })),
+          el('button', { class: 'btn secondary', type: 'submit' }, 'Lower it'),
+        ),
+      ),
+      el('div', null,
+        el('div', { class: 'row' },
+          el('button', { class: atm.frozen ? 'btn' : 'btn danger', type: 'button', onclick: () => press('atm-freeze', () => freezeAtm(!atm.frozen)) },
+            atm.frozen ? 'Unfreeze the ATM' : 'Freeze the ATM'),
+        ),
+        errorSlot('atm-freeze'),
+        form('atm-pin', setAtmPin,
+          el('h3', null, atm.pinSet ? 'Change the card PIN' : 'Set a card PIN'),
+          el('p', { class: 'warning' }, 'Role-play only. Never use a real bank card PIN, or any PIN you use anywhere else.'),
+          field('4-digit PIN', el('input', { name: 'pin', type: 'password', inputmode: 'numeric', pattern: '[0-9]{4}', minlength: 4, maxlength: 4, required: true, autocomplete: 'off' })),
+          field('Confirm', el('span', { class: 'row' }, el('input', { name: 'notMine', type: 'checkbox', required: true }), 'This is not a real bank PIN.')),
+          el('button', { class: 'btn secondary', type: 'submit' }, atm.pinSet ? 'Change PIN' : 'Set PIN'),
+        ),
+      ),
+    ),
+    game && game.status !== 'proposed' ? subLimitsForm(game, 'withdrawal') : null,
+    game ? playList(game, true) : null,
+  );
+}
+
+function atmStatus(atm) {
+  if (atm.frozen) return 'Frozen';
+  if (atm.lockedUntil) return `Card locked until ${clock(atm.lockedUntil)}`;
+  if (!atm.pinSet) return 'No card PIN yet';
+  return 'Ready';
+}
+
+function atmLive(sub) {
+  const atm = sub.atm;
+  return el('div', { class: 'atm', id: 'atm-live' },
+    el('div', { class: 'atm-screen', id: 'atm-screen', 'aria-live': 'polite' },
+      el('p', { class: 'kicker' }, atmStatus(atm)),
+      el('p', { class: 'atm-big' }, money(atm.balanceCents)),
+      el('p', { class: 'muted' }, `Loaded ${money(atm.loadedCents)} · withdrawn ${money(atm.withdrawnCents)}`),
+    ),
+    el('div', { class: 'atm-slots' },
+      el('div', { class: 'card-slot', id: 'atm-card' }, el('span', { class: 'card' })),
+      el('div', { class: 'cash-slot', id: 'atm-cash' }),
+    ),
+    el('p', { class: 'muted live' }, 'Live. Checks for withdrawals every few seconds.'),
+  );
+}
+
+function watchLive() {
+  if (state.liveRunning) return;
+  state.liveRunning = true;
+  const tick = async () => {
+    if (route() !== '/games' || state.role !== 'sub') {
+      state.liveRunning = false;
+      return;
+    }
+    try {
+      const { sub } = await api('/api/me/live');
+      const seen = new Set((state.sub?.games.atm?.plays || []).map((play) => play.id));
+      const fresh = (sub.games.atm?.plays || []).filter((play) => !seen.has(play.id));
+      const hadAtm = Boolean(state.sub?.games.atm);
+      state.sub = sub;
+      if (hadAtm && fresh.length) {
+        state.replayQueue.push(...fresh);
+        runReplays();
+      } else if (JSON.stringify(sub) !== state.liveSig && canRefresh()) {
+        render();
+      }
+    } catch { /* try again on the next tick */ }
+    setTimeout(tick, 3000);
+  };
+  setTimeout(tick, 3000);
+}
+
+function canRefresh() {
+  if (state.spin.busy || state.replaying) return false;
+  return !document.activeElement?.matches('input, select, textarea');
+}
+
+async function runReplays() {
+  if (state.replaying) return;
+  while (state.replayQueue.length) {
+    await replayWithdrawal(state.replayQueue.shift());
+  }
+  if (route() === '/games') render();
+}
+
+async function replayOnDemand(play) {
+  if (state.replaying) return;
+  document.getElementById('atm-live')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  await replayWithdrawal(play);
+  render();
+}
+
+/** Rebuilds a saved withdrawal on the sub's screen: card in, PIN typed digit by digit, cash out, balance ticking down. */
+async function replayWithdrawal(play) {
+  const screen = document.getElementById('atm-screen');
+  const card = document.getElementById('atm-card');
+  const cash = document.getElementById('atm-cash');
+  if (!screen || !card || !cash) return;
+  state.replaying = true;
+  const fast = reducedMotion();
+  const step = (ms) => wait(fast ? 0 : ms);
+  const show = (...children) => screen.replaceChildren(...children);
+  try {
+    cash.classList.remove('dispensing');
+    cash.replaceChildren();
+    card.classList.add('in');
+    show(el('p', { class: 'kicker' }, 'Card inserted'), el('p', { class: 'atm-big' }, 'Enter PIN'));
+    await step(800);
+    for (let attempt = 0; attempt <= (play.wrongTries || 0); attempt += 1) {
+      const dots = [0, 1, 2, 3].map(() => el('span', { class: 'dot' }));
+      show(el('p', { class: 'kicker' }, 'Enter PIN'), el('p', { class: 'dots' }, ...dots));
+      for (const dot of dots) {
+        await step(350);
+        dot.classList.add('on');
+      }
+      await step(400);
+      if (attempt < (play.wrongTries || 0)) {
+        show(el('p', { class: 'kicker' }, 'Wrong PIN'), el('p', { class: 'atm-big wrong' }, 'Try again'));
+        await step(900);
+      }
+    }
+    show(el('p', { class: 'kicker' }, play.label), el('p', { class: 'atm-big' }, money(play.amountCents)));
+    await step(800);
+    const before = play.atmBalanceAfterCents + play.amountCents;
+    const balance = el('p', { class: 'atm-big' }, money(before));
+    show(el('p', { class: 'kicker' }, `Dispensing ${money(play.amountCents)}`), balance);
+    cash.replaceChildren(...[1, 2, 3].map((n) => el('span', { class: `bill b${n}` })));
+    cash.classList.add('dispensing');
+    const ticks = fast ? 1 : 24;
+    for (let tick = 1; tick <= ticks; tick += 1) {
+      await step(50);
+      balance.textContent = money(before - Math.round((play.amountCents * tick) / ticks));
+    }
+    await step(1000);
+    card.classList.remove('in');
+    show(
+      el('p', { class: 'kicker' }, 'Take your card'),
+      el('p', { class: 'atm-big' }, money(play.atmBalanceAfterCents)),
+      el('p', { class: 'muted' }, `${clock(play.at)} · ${money(play.amountCents)} added to your debt`),
+    );
+    await step(1600);
+  } finally {
+    state.replaying = false;
+  }
+}
+
+async function acceptTerms(game) {
+  await refreshGames(await api('/api/me/game/accept', { method: 'POST', body: { game: game.key, version: game.version } }), 'Accepted. The terms are in the book.');
+}
+
+async function setGameLimits(key, body) {
+  await refreshGames(await api('/api/me/game/limits', { method: 'POST', body: { game: key, ...body } }), 'Your limits are saved.');
+}
+
+async function saveGameCaps(event, key) {
+  const data = Object.fromEntries(new FormData(event.target));
+  await setGameLimits(key, {
+    perPlayCapCents: data.perPlay.trim() ? dollarsToCents(data.perPlay) : null,
+    dailyCapCents: data.daily.trim() ? dollarsToCents(data.daily) : null,
+  });
+}
+
+async function loadAtm(event) {
+  const addCents = dollarsToCents(new FormData(event.target).get('amount'));
+  await refreshGames(await api('/api/me/atm/load', { method: 'POST', body: { addCents } }), 'The ATM is loaded.');
+}
+
+async function lowerAtm(event) {
+  const balanceCents = dollarsToCents(new FormData(event.target).get('amount'));
+  await refreshGames(await api('/api/me/atm/lower', { method: 'POST', body: { balanceCents } }), 'The ATM balance is lowered.');
+}
+
+async function freezeAtm(frozen) {
+  await refreshGames(await api('/api/me/atm/freeze', { method: 'POST', body: { frozen } }), frozen ? 'The ATM is frozen.' : 'The ATM is open again.');
+}
+
+async function setAtmPin(event) {
+  const data = Object.fromEntries(new FormData(event.target));
+  if (!/^\d{4}$/.test(data.pin || '')) throw new Error('The card PIN is exactly 4 digits.');
+  await refreshGames(await api('/api/me/atm/pin', { method: 'POST', body: { pin: data.pin, notMyBankPin: data.notMine === 'on' } }), 'Card PIN set. It is never shown again.');
+}
+
+async function refreshGames(next, notice) {
+  state.sub = next.sub;
+  state.notice = notice;
+  render();
+}
+
+function studioGames(subId) {
+  const sub = state.studio.subs.find((item) => item.id === subId);
+  if (!sub) {
+    shell('/studio', ...banner(), el('h1', null, 'Games'), el('p', { class: 'lede' }, 'That name is not in the book.'), el('a', { class: 'btn', href: '#/studio' }, 'Back to the studio'));
+    return;
+  }
+  shell('/studio',
+    ...banner(),
+    el('p', { class: 'kicker' }, el('a', { href: '#/studio' }, 'Studio'), ` · ${sub.handle}`),
+    el('h1', null, 'Games'),
+    el('p', { class: 'lede' }, sub.debt?.status === 'active'
+      ? `Debt ${money(sub.debt.balanceCents)}. Every result adds to it, and nothing a game does can lower it.`
+      : 'Games play only against an active signed debt. Write one and have it signed first.'),
+    studioSlot(sub),
+    studioAtm(sub),
+  );
+}
+
+function statusLine(game) {
+  const own = [];
+  if (game.subLimits.perPlayCapCents != null) own.push(`his own per-play cap ${money(game.subLimits.perPlayCapCents)}`);
+  if (game.subLimits.dailyCapCents != null) own.push(`his own daily cap ${money(game.subLimits.dailyCapCents)}`);
+  return el('p', null,
+    el('span', { class: 'tag' }, GAME_STATUS[game.status]),
+    ` Version ${game.version}${game.acceptedVersion ? `, he accepted version ${game.acceptedVersion}` : ''}. Today ${money(game.todayCents)} of ${money(game.limits.dailyCapCents)}.`,
+    own.length ? ` He set ${own.join(' and ')}.` : '',
+  );
+}
+
+function previewOf(key) {
+  const odds = state.preview[key];
+  if (!odds) return null;
+  const game = { odds, limits: odds.limits, subLimits: {} };
+  return el('div', { class: 'preview' }, el('h3', null, 'Preview, not saved'), key.startsWith('slot') ? slotTerms(game) : atmTerms(game));
+}
+
+function studioSlot(sub) {
+  const game = sub.games.slot;
+  const terms = game?.terms || state.studio.defaults.slot;
+  return el('section', { class: 'panel', id: 'slot' },
+    el('h2', null, 'Slot machine'),
+    game ? statusLine(game) : el('p', { class: 'muted' }, 'Not set up yet. The form starts from the defaults.'),
+    game ? el('details', null, el('summary', null, 'What he sees'), slotTerms(game)) : null,
+    slotEditor(sub, terms, Boolean(game)),
+    previewOf(`slot-${sub.id}`),
+    game ? playList(game, false) : null,
+  );
+}
+
+function option(value, label, selected) {
+  return el('option', { value, selected: selected ? 'selected' : null }, label);
+}
+
+function slotEditor(sub, terms, exists) {
+  const symbols = state.studio.defaults.symbols;
+  const weightOf = (id) => terms.symbols.find((symbol) => symbol.id === id)?.weight;
+  const rules = terms.payouts.filter((rule) => rule.match !== 'other');
+  const other = terms.payouts.find((rule) => rule.match === 'other');
+  const rows = [...rules, null, null].slice(0, 11);
+  return form(`slot-edit-${sub.id}`, (event, restore) => saveTerms(event, sub.id, 'slot', slotTermsFrom, restore),
+    el('h3', null, exists ? 'Change the terms' : 'Set it up'),
+    el('p', { class: 'muted' }, 'Make the odds as unfair as you like. He sees them exactly, and any change waits for him to accept it again.'),
+    el('p', { class: 'label' }, 'Reels: tick a symbol to use it, and give it a weight from 1 to 100.'),
+    el('div', { class: 'symbols' }, ...symbols.map((id) => el('div', { class: 'symbol-pick' },
+      el('label', { class: 'row' }, el('input', { type: 'checkbox', name: `on-${id}`, checked: weightOf(id) != null }), `${SYMBOLS[id]} ${id}`),
+      el('input', { name: `w-${id}`, inputmode: 'numeric', value: weightOf(id) ?? 1, 'aria-label': `${id} weight`, class: 'small' }),
+    ))),
+    field('Stake', el('input', { name: 'stake', inputmode: 'decimal', value: dollars(terms.stakeCents), required: true })),
+    el('p', { class: 'label' }, 'Payout table, read top to bottom. The first line that matches decides the charge.'),
+    ...rows.map((rule, index) => el('div', { class: 'rule row', 'data-rule': index },
+      el('select', { name: 'match', 'aria-label': 'Match' },
+        option('', 'Unused', !rule),
+        option('three', 'Three', rule?.match === 'three'),
+        option('two', 'Exactly two', rule?.match === 'two'),
+      ),
+      el('select', { name: 'symbol', 'aria-label': 'Symbol' },
+        option('', 'of any kind', !rule?.symbol),
+        ...symbols.map((id) => option(id, `${id}s`, rule?.symbol === id)),
+      ),
+      el('input', { name: 'mult', inputmode: 'decimal', value: rule ? rule.multiplierPct / 100 : '', placeholder: '2', 'aria-label': 'Multiplier', class: 'small' }),
+      el('span', { class: 'muted' }, 'x the stake'),
+    )),
+    el('div', { class: 'rule row' },
+      el('span', null, 'Anything else'),
+      el('input', { name: 'otherMult', inputmode: 'decimal', value: other.multiplierPct / 100, required: true, 'aria-label': 'Anything else multiplier', class: 'small' }),
+      el('span', { class: 'muted' }, 'x the stake'),
+    ),
+    capsFields(terms, 'spin'),
+    termsButtons(),
+  );
+}
+
+function capsFields(terms, unit) {
+  return el('div', { class: 'grid cards' },
+    field(`Most per ${unit}`, el('input', { name: 'perPlay', inputmode: 'decimal', value: dollars(terms.perPlayCapCents), required: true })),
+    field('Most per New York day', el('input', { name: 'daily', inputmode: 'decimal', value: dollars(terms.dailyCapCents), required: true })),
+    field(`Seconds between ${unit}s`, el('input', { name: 'cooldown', inputmode: 'numeric', value: terms.cooldownSeconds, required: true })),
+  );
+}
+
+function termsButtons() {
+  return el('div', { class: 'row' },
+    el('button', { class: 'btn', type: 'submit', name: 'intent', value: 'save' }, 'Propose these terms'),
+    el('button', { class: 'btn secondary', type: 'submit', name: 'intent', value: 'preview' }, 'Preview the odds'),
+  );
+}
+
+function multiplierPct(value) {
+  const n = Number(String(value).trim().replace(/x$/i, ''));
+  if (!Number.isFinite(n) || n <= 0) throw new Error('Use a multiplier like 2 or 1.5.');
+  return Math.round(n * 100);
+}
+
+function wholeNumber(value, label) {
+  if (!/^\d+$/.test(String(value).trim())) throw new Error(`${label} must be a whole number.`);
+  return Number(value);
+}
+
+function capsFrom(node) {
+  const get = (name) => node.querySelector(`[name="${name}"]`).value;
+  return {
+    perPlayCapCents: dollarsToCents(get('perPlay')),
+    dailyCapCents: dollarsToCents(get('daily')),
+    cooldownSeconds: wholeNumber(get('cooldown'), 'The cooldown'),
+  };
+}
+
+function slotTermsFrom(node) {
+  const get = (name) => node.querySelector(`[name="${name}"]`);
+  const symbols = state.studio.defaults.symbols
+    .filter((id) => get(`on-${id}`).checked)
+    .map((id) => ({ id, weight: wholeNumber(get(`w-${id}`).value, `The ${id} weight`) }));
+  const payouts = [...node.querySelectorAll('[data-rule]')]
+    .filter((row) => row.querySelector('[name=match]').value)
+    .map((row) => ({
+      match: row.querySelector('[name=match]').value,
+      symbol: row.querySelector('[name=symbol]').value || null,
+      multiplierPct: multiplierPct(row.querySelector('[name=mult]').value),
+    }));
+  payouts.push({ match: 'other', symbol: null, multiplierPct: multiplierPct(get('otherMult').value) });
+  return { symbols, stakeCents: dollarsToCents(get('stake').value), payouts, ...capsFrom(node) };
+}
+
+function atmTermsFrom(node) {
+  const get = (name) => node.querySelector(`[name="${name}"]`).value;
+  const kick = [...node.querySelectorAll('[data-kick]')]
+    .filter((row) => row.querySelector('[name=kickAmount]').value.trim())
+    .map((row) => ({
+      amountCents: dollarsToCents(row.querySelector('[name=kickAmount]').value),
+      weight: wholeNumber(row.querySelector('[name=kickWeight]').value, 'Each kick weight'),
+    }));
+  return {
+    quickCents: dollarsToCents(get('quick')),
+    skimMinCents: dollarsToCents(get('skimMin')),
+    skimMaxCents: dollarsToCents(get('skimMax')),
+    kick,
+    ...capsFrom(node),
+  };
+}
+
+async function saveTerms(event, subId, key, read, restore) {
+  const terms = read(event.target);
+  if (event.submitter?.value === 'preview') {
+    const { odds } = await api('/api/studio/game/preview', { method: 'POST', body: { game: key, terms } });
+    state.preview[`${key}-${subId}`] = { ...odds, limits: { perPlayCapCents: terms.perPlayCapCents, dailyCapCents: terms.dailyCapCents, cooldownSeconds: terms.cooldownSeconds } };
+    render();
+    restore();
+    document.querySelector(`#${key} .preview`)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
+  await api('/api/studio/game', { method: 'POST', body: { subId, game: key, terms } });
+  delete state.preview[`${key}-${subId}`];
+  state.studio = await api('/api/studio');
+  state.notice = 'Proposed. He has to accept these terms before the next play.';
+  render();
+}
+
+function studioAtm(sub) {
+  const game = sub.games.atm;
+  const atm = sub.atm;
+  return el('section', { class: 'panel', id: 'atm' },
+    el('h2', null, 'Human ATM'),
+    el('p', null, `He loaded ${money(atm.loadedCents)} in all. ${money(atm.withdrawnCents)} withdrawn, ${money(atm.balanceCents)} left.${atm.frozen ? ' He froze it.' : ''}${atm.pinSet ? '' : ' He has not set a card PIN.'}`),
+    game ? statusLine(game) : el('p', { class: 'muted' }, 'Set the terms below before the card will work.'),
+    atmMachine(sub),
+    game ? el('details', null, el('summary', null, 'What he sees'), atmTerms(game)) : null,
+    atmEditor(sub, game?.terms || state.studio.defaults.atm, Boolean(game)),
+    previewOf(`atm-${sub.id}`),
+    game ? playList(game, false) : null,
+  );
+}
+
+function atmEditor(sub, terms, exists) {
+  const rows = [...terms.kick, null, null].slice(0, 6);
+  return form(`atm-edit-${sub.id}`, (event, restore) => saveTerms(event, sub.id, 'atm', atmTermsFrom, restore),
+    el('h3', null, exists ? 'Change the terms' : 'Set the terms'),
+    el('p', { class: 'muted' }, 'Any change waits for him to accept it again. Every option must fit under the per-withdrawal cap.'),
+    el('div', { class: 'grid cards' },
+      field('Fast cash amount', el('input', { name: 'quick', inputmode: 'decimal', value: dollars(terms.quickCents), required: true })),
+      field('Surprise skim from', el('input', { name: 'skimMin', inputmode: 'decimal', value: dollars(terms.skimMinCents), required: true })),
+      field('Surprise skim up to', el('input', { name: 'skimMax', inputmode: 'decimal', value: dollars(terms.skimMaxCents), required: true })),
+    ),
+    el('p', { class: 'label' }, 'Kick it for a bonus: each amount and its weight. Blank rows are ignored.'),
+    ...rows.map((item, index) => el('div', { class: 'rule row', 'data-kick': index },
+      el('input', { name: 'kickAmount', inputmode: 'decimal', value: item ? dollars(item.amountCents) : '', placeholder: 'Amount', 'aria-label': 'Kick amount', class: 'small' }),
+      el('span', { class: 'muted' }, 'weight'),
+      el('input', { name: 'kickWeight', inputmode: 'numeric', value: item ? item.weight : '1', 'aria-label': 'Kick weight', class: 'small' }),
+    )),
+    capsFields(terms, 'withdrawal'),
+    termsButtons(),
+  );
+}
+
+function atmUi(subId) {
+  state.atm[subId] ||= { phase: 'idle', digits: '', cardToken: null, result: null, busy: false };
+  return state.atm[subId];
+}
+
+function atmMachine(sub) {
+  const ui = atmUi(sub.id);
+  const atm = sub.atm;
+  const game = sub.games.atm;
+  const key = `atm-${sub.id}`;
+  if (atm.frozen || atm.lockedUntil) Object.assign(ui, { phase: 'idle', digits: '', cardToken: null });
+  let screen;
+  let controls;
+  if (atm.frozen) {
+    screen = [el('p', { class: 'kicker' }, 'Out of service'), el('p', { class: 'atm-big' }, 'Frozen'), el('p', { class: 'muted' }, 'He froze the ATM.')];
+  } else if (atm.lockedUntil) {
+    screen = [el('p', { class: 'kicker' }, 'Card locked'), el('p', { class: 'atm-big wrong' }, 'Locked'), el('p', { class: 'muted' }, `Three wrong PINs. Try again after ${clock(atm.lockedUntil)}.`)];
+  } else if (ui.phase === 'pin') {
+    screen = [el('p', { class: 'kicker' }, 'Enter PIN'), el('p', { class: 'dots' }, ...[0, 1, 2, 3].map((n) => el('span', { class: n < ui.digits.length ? 'dot on' : 'dot' }))), el('p', { class: 'muted' }, `${atm.pinTriesLeft} ${atm.pinTriesLeft === 1 ? 'try' : 'tries'} before the card locks`)];
+    controls = keypad(sub);
+  } else if (ui.phase === 'menu') {
+    screen = [el('p', { class: 'kicker' }, 'Available'), el('p', { class: 'atm-big' }, money(atm.balanceCents)), el('p', { class: 'muted' }, game ? `Today ${money(game.leftTodayCents)} left of ${money(game.limits.dailyCapCents)}` : 'No terms yet')];
+    controls = atmMenu(sub);
+  } else if (ui.phase === 'cash' && ui.result) {
+    screen = [el('p', { class: 'kicker' }, ui.result.label), el('p', { class: 'atm-big' }, money(ui.result.amountCents)), el('p', { class: 'muted' }, `Left in the ATM ${money(ui.result.atmBalanceAfterCents)}. Debt now ${money(ui.result.balanceAfterCents)}.`)];
+    controls = el('div', { class: 'row' },
+      el('button', { class: 'btn', type: 'button', onclick: () => { ui.phase = 'menu'; render(); } }, 'Another withdrawal'),
+      el('button', { class: 'btn secondary', type: 'button', onclick: () => press(key, () => ejectCard(sub.id)) }, 'Eject card'),
+    );
+  } else {
+    screen = [el('p', { class: 'kicker' }, atm.pinSet ? 'Welcome' : 'No card PIN yet'), el('p', { class: 'atm-big' }, 'Insert card'), el('p', { class: 'muted' }, `${sub.handle}'s machine`)];
+    controls = el('button', {
+      class: 'btn',
+      type: 'button',
+      disabled: !atm.pinSet,
+      onclick: () => {
+        state.formError = null;
+        Object.assign(ui, { phase: 'pin', digits: '' });
+        render();
+      },
+    }, 'Insert card');
+  }
+  return el('div', { class: 'atm studio-atm' },
+    el('div', { class: 'atm-screen', 'aria-live': 'polite' }, ...screen),
+    el('div', { class: 'atm-slots' },
+      el('div', { class: ui.phase === 'idle' ? 'card-slot' : 'card-slot in' }, el('span', { class: 'card' })),
+      el('div', { class: ui.phase === 'cash' ? 'cash-slot dispensing' : 'cash-slot' },
+        ...(ui.phase === 'cash' ? [1, 2, 3].map((n) => el('span', { class: `bill b${n}` })) : [])),
+    ),
+    controls,
+    errorSlot(key),
+  );
+}
+
+function keypad(sub) {
+  const ui = atmUi(sub.id);
+  const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'clear', '0', 'enter'];
+  return el('div', { class: 'keypad' }, ...keys.map((key) => el('button', {
+    class: key.length > 1 ? `key ${key}` : 'key',
+    type: 'button',
+    disabled: ui.busy,
+    onclick: () => keyPress(sub.id, key),
+  }, key === 'clear' ? 'Clear' : key === 'enter' ? 'Enter' : key)),
+  el('button', { class: 'key cancel', type: 'button', onclick: () => { Object.assign(ui, { phase: 'idle', digits: '' }); render(); } }, 'Cancel'));
+}
+
+function keyPress(subId, key) {
+  const ui = atmUi(subId);
+  state.formError = null;
+  if (key === 'enter') {
+    press(`atm-${subId}`, () => enterPin(subId));
+    return;
+  }
+  if (key === 'clear') ui.digits = '';
+  else if (ui.digits.length < 4) ui.digits += key;
+  render();
+}
+
+async function enterPin(subId) {
+  const ui = atmUi(subId);
+  const pin = ui.digits;
+  ui.digits = '';
+  if (pin.length !== 4) throw new Error('Type all 4 digits.');
+  ui.busy = true;
+  try {
+    const result = await api('/api/studio/atm/pin', { method: 'POST', body: { subId, pin } });
+    Object.assign(ui, { cardToken: result.cardToken, phase: 'menu' });
+  } finally {
+    ui.busy = false;
+    state.studio = await api('/api/studio');
+    render();
+  }
+}
+
+function atmMenu(sub) {
+  const game = sub.games.atm;
+  const key = `atm-${sub.id}`;
+  if (!game) return el('p', { class: 'muted' }, 'Set the ATM terms first.');
+  const odds = game.odds;
+  return el('div', { class: 'atm-menu' },
+    form(`atm-amount-${sub.id}`, (event) => withdraw(sub.id, 'amount', dollarsToCents(new FormData(event.target).get('amount'))),
+      field(`Amount, up to ${money(Math.min(game.limits.perPlayCapCents, sub.atm.balanceCents))}`, el('input', { name: 'amount', inputmode: 'decimal', required: true, placeholder: '20.00' })),
+      el('button', { class: 'btn', type: 'submit' }, 'Withdraw'),
+    ),
+    el('div', { class: 'row' },
+      el('button', { class: 'btn secondary', type: 'button', onclick: () => press(key, () => withdraw(sub.id, 'quick')) }, `Fast cash ${money(odds.quick.amountCents)}`),
+      el('button', { class: 'btn secondary', type: 'button', onclick: () => press(key, () => withdraw(sub.id, 'skim')) }, `Surprise skim ${money(odds.skim.minCents)}–${money(odds.skim.maxCents)}`),
+      el('button', { class: 'btn secondary', type: 'button', onclick: () => press(key, () => withdraw(sub.id, 'kick')) }, 'Kick it for a bonus'),
+      el('button', { class: 'btn danger', type: 'button', onclick: () => press(key, () => ejectCard(sub.id)) }, 'Eject card'),
+    ),
+  );
+}
+
+async function withdraw(subId, option, amountCents) {
+  const ui = atmUi(subId);
+  if (ui.busy) return;
+  ui.busy = true;
+  const id = pendingPlayId(`atm-${subId}`);
+  try {
+    const result = await api('/api/studio/atm/withdraw', { method: 'POST', body: { subId, cardToken: ui.cardToken, playId: id, option, amountCents } });
+    clearPendingPlay(`atm-${subId}`);
+    Object.assign(ui, { result: result.play, phase: 'cash' });
+  } catch (error) {
+    if (/Insert the card/.test(error.message)) Object.assign(ui, { phase: 'idle', cardToken: null });
+    throw error;
+  } finally {
+    ui.busy = false;
+    state.studio = await api('/api/studio');
+    render();
+  }
+}
+
+async function ejectCard(subId) {
+  await api('/api/studio/atm/eject', { method: 'POST', body: { subId } });
+  Object.assign(atmUi(subId), { phase: 'idle', digits: '', cardToken: null, result: null });
+  state.studio = await api('/api/studio');
+  render();
+}
+
 function gate() {
   document.getElementById('app').replaceChildren(el('div', { class: 'gate' },
     el('section', { class: 'panel' },
@@ -801,6 +1712,7 @@ function render() {
   const path = route();
   if (path.startsWith('/join')) join();
   else if (path.startsWith('/book')) book();
+  else if (path.startsWith('/games')) games();
   else if (path.startsWith('/studio')) studio();
   else home();
 }
@@ -818,5 +1730,9 @@ async function boot() {
   render();
 }
 
-window.addEventListener('hashchange', render);
+window.addEventListener('hashchange', () => {
+  state.formError = null;
+  render();
+  window.scrollTo(0, 0);
+});
 boot();
