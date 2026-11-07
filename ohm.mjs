@@ -9,6 +9,7 @@ import { Buffer } from 'node:buffer';
 const RATE_URL = 'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd';
 
 export const LND_CONNECT_TIMEOUT_MS = 10_000;
+const CHECKOUT_BUDGET_MS = 9_000;
 const RATE_TIMEOUT_MS = 5_000;
 const MIN_CONNECT_MS = 2_000;
 
@@ -133,7 +134,12 @@ export function lndRequest(path, method, body, { connectTimeoutMs = LND_CONNECT_
 
 async function bitcoinUsd() {
   if (Date.now() - rateCache.at < 60_000 && rateCache.usd) return rateCache.usd;
-  const response = await fetch(RATE_URL, { signal: AbortSignal.timeout(RATE_TIMEOUT_MS) });
+  let response;
+  try {
+    response = await fetch(RATE_URL, { signal: AbortSignal.timeout(RATE_TIMEOUT_MS) });
+  } catch {
+    throw new Error('Could not price Bitcoin, so no invoice was created.');
+  }
   if (!response.ok) throw new Error('Could not price Bitcoin, so no invoice was created.');
   const body = await response.json();
   const usd = body?.bitcoin?.usd;
@@ -158,7 +164,7 @@ export function createOhm() {
         expiry: '3600',
       };
       if (includeRouteHints) body.private = true;
-      const left = LND_CONNECT_TIMEOUT_MS - (Date.now() - started);
+      const left = CHECKOUT_BUDGET_MS - (Date.now() - started);
       const created = await lndRequest('/v1/invoices', 'POST', body, { connectTimeoutMs: Math.max(left, MIN_CONNECT_MS) });
       const paymentHashHex = Buffer.from(created.r_hash, 'base64').toString('hex');
       const bolt11 = String(created.payment_request || '').trim().replace(/^lightning:/i, '');
