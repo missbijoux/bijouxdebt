@@ -268,7 +268,7 @@ input.small { width: 6.5rem; min-height: 40px; padding: 8px 10px; }
   z-index: 1;
 }
 .card-slot { width: 124px; height: 72px; }
-.card {
+.atm-card {
   position: absolute;
   top: 10px;
   left: 12px;
@@ -278,7 +278,7 @@ input.small { width: 6.5rem; min-height: 40px; padding: 8px 10px; }
   background: linear-gradient(135deg, var(--gold-2), var(--gold) 45%, var(--blush));
   transition: transform 0.7s ease;
 }
-.card-slot.in .card { transform: translateY(-80px); }
+.card-slot.in .atm-card { transform: translateY(-80px); }
 .cash-slot { width: 160px; height: 80px; }
 .bill {
   position: absolute;
@@ -317,7 +317,7 @@ input.small { width: 6.5rem; min-height: 40px; padding: 8px 10px; }
 @media (prefers-reduced-motion: reduce) {
   .reel.spinning .strip, .reel.landed, .cash-slot.dispensing .bill, .dot.on { animation: none; }
   .cash-slot.dispensing .bill { opacity: 1; transform: translateY(78px); }
-  .card { transition: none; }
+  .atm-card { transition: none; }
 }
 @media (max-width: 800px) {
   .split { grid-template-columns: 1fr; }
