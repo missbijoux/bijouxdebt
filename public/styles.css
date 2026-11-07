@@ -197,6 +197,26 @@ input.small { width: 6.5rem; min-height: 40px; padding: 8px 10px; }
 .symbol-pick input.small { width: 4.5rem; }
 .small-btn { min-height: 34px; padding: 6px 12px; font-size: 0.85rem; }
 .preview { border-top: 1px dashed var(--line); margin-top: 18px; padding-top: 12px; }
+.panel.locked { border-color: rgba(255, 180, 180, 0.55); background: linear-gradient(180deg, rgba(255, 180, 180, 0.08), transparent 40%), var(--card); }
+.locked-now { background: #3a171c; border-radius: 10px; padding: 10px 12px; margin: 12px 0; }
+.locked-now .kicker { margin: 0 0 4px; }
+.lock-list { margin: 8px 0 12px; padding-left: 1.2rem; display: grid; gap: 6px; color: var(--danger); line-height: 1.45; }
+.locked-now .lock-list { margin-bottom: 0; }
+.atm-screen .atm-lock { margin-top: 8px; color: var(--danger); }
+.claim { padding: 12px 0; border-bottom: 1px solid rgba(247, 239, 232, 0.08); }
+.claim p { margin: 0 0 8px; }
+.proof-thumb {
+  display: block;
+  max-width: 220px;
+  max-height: 260px;
+  width: auto;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  margin: 0 0 10px;
+  background: #140910;
+}
+input[type="file"] { padding: 9px 12px; }
 
 .slot {
   text-align: center;
