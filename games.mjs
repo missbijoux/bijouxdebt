@@ -8,7 +8,7 @@
  */
 
 import { randomInt } from 'node:crypto';
-import { LIMITS, money } from './ledger.mjs';
+import { dueDate, LIMITS, money, nyDate, previousDue } from './ledger.mjs';
 
 export class GameError extends Error {
   constructor(message, status = 400) {
@@ -416,6 +416,8 @@ export function assertPlayable({ sub, key, maxChargeCents, now, today }) {
     throw new GameError('Games only add to an active signed debt, and none is running.');
   }
   if (game.pausedBySub) throw new GameError('This game is paused.');
+  const locks = gameLocks(sub, today, maxChargeCents);
+  if (locks.length) throw new GameError(locks[0].message, 423);
   const limits = effectiveLimits(game);
   const last = lastPlayOf(sub.plays, key);
   if (last) {
@@ -432,6 +434,122 @@ export function assertPlayable({ sub, key, maxChargeCents, now, today }) {
     );
   }
   return limits;
+}
+
+export function defaultStanding() {
+  return { hold: false, lockWhenOverdue: true, minPaidCents: 0, maxUnpaidGameCents: 0 };
+}
+
+/** Her rules for who may play. They only ever lock games, so changing them needs no new consent. */
+export function normalizeStanding(input = {}, current = defaultStanding()) {
+  const next = { ...current };
+  if (input.hold !== undefined) next.hold = Boolean(input.hold);
+  if (input.lockWhenOverdue !== undefined) next.lockWhenOverdue = Boolean(input.lockWhenOverdue);
+  if (input.minPaidCents !== undefined) {
+    next.minPaidCents = intIn(input.minPaidCents, 0, LIMITS.maxPrincipalCents,
+      `The paid minimum must be from $0.00 to ${money(LIMITS.maxPrincipalCents)}.`);
+  }
+  if (input.maxUnpaidGameCents !== undefined) {
+    next.maxUnpaidGameCents = intIn(input.maxUnpaidGameCents, 0, LIMITS.maxGameDailyCents * 10,
+      `The unpaid limit must be from $0.00 to ${money(LIMITS.maxGameDailyCents * 10)}.`);
+  }
+  return next;
+}
+
+/** Real money only: Lightning that settled, payments she recorded, and claims she confirmed. Sample checkouts never count. */
+function provenPayment(entry) {
+  return entry.status === 'confirmed'
+    && (entry.kind === 'payment' || entry.kind === 'tribute')
+    && entry.method !== 'sandbox';
+}
+
+export function provenPaidCents(entries) {
+  return entries.reduce((sum, entry) => (provenPayment(entry) ? sum + entry.amountCents : sum), 0);
+}
+
+/**
+ * Game charges not yet covered by real debt payments, walked in book order.
+ * A forgiven balance takes its game charges with it. A settled one does not.
+ */
+export function unpaidGameCents(entries) {
+  let owed = 0;
+  for (const entry of entries) {
+    if (entry.kind === 'game') owed += entry.amountCents;
+    else if (entry.kind === 'forgive') owed = 0;
+    else if (provenPayment(entry) && entry.appliedDebtCents > 0) owed -= Math.min(owed, entry.appliedDebtCents);
+  }
+  return owed;
+}
+
+/** The latest due date before today whose minimum was not met by real payments, counting late ones. */
+export function missedMinimum(sub, today) {
+  const debt = sub.debt;
+  if (!debt || debt.status !== 'active' || !(debt.minPaymentCents > 0) || !(debt.balanceCents > 0) || !debt.signedAt) return null;
+  const [year, month] = today.split('-').map(Number);
+  let due = dueDate(year, month, debt.dueDay);
+  if (due >= today) due = previousDue(due, debt.dueDay);
+  if (due < nyDate(new Date(debt.signedAt))) return null;
+  const windowStart = previousDue(due, debt.dueDay);
+  const paid = (sub.entries || []).reduce((sum, entry) => {
+    const day = entry.nyDay || nyDate(new Date(entry.at));
+    return provenPayment(entry) && day > windowStart && day <= today ? sum + (entry.appliedDebtCents || 0) : sum;
+  }, 0);
+  if (paid >= debt.minPaymentCents) return null;
+  return { due, minimumCents: debt.minPaymentCents, shortCents: debt.minPaymentCents - paid };
+}
+
+/**
+ * Every reason games are locked for this name right now, strictest first.
+ * extraCents is the worst a pending play could add, so it can never carry him past her unpaid limit.
+ */
+export function gameLocks(sub, today, extraCents = 0) {
+  const rules = sub.standing || defaultStanding();
+  const locks = [];
+  if (rules.hold) locks.push({ code: 'hold', message: 'She has put games on hold for this name.' });
+  if (rules.lockWhenOverdue) {
+    const missed = missedMinimum(sub, today);
+    if (missed) {
+      locks.push({
+        code: 'overdue',
+        message: `The ${money(missed.minimumCents)} minimum due ${missed.due} was missed. Pay ${money(missed.shortCents)} toward the debt to unlock games.`,
+      });
+    }
+  }
+  if (rules.minPaidCents > 0) {
+    const paid = provenPaidCents(sub.entries || []);
+    if (paid < rules.minPaidCents) {
+      locks.push({
+        code: 'unproven',
+        message: `Games unlock after ${money(rules.minPaidCents - paid)} more is paid. Lightning counts once it settles. Other payments count once she confirms them.`,
+      });
+    }
+  }
+  if (rules.maxUnpaidGameCents > 0) {
+    const owed = unpaidGameCents(sub.entries || []);
+    if (owed >= rules.maxUnpaidGameCents) {
+      locks.push({
+        code: 'unpaid',
+        message: `Unpaid game charges are ${money(owed)}, at her limit of ${money(rules.maxUnpaidGameCents)}. Pay at least ${money(Math.max(owed - rules.maxUnpaidGameCents + 1, LIMITS.minCheckoutCents))} toward the debt to play again.`,
+      });
+    } else if (owed + extraCents > rules.maxUnpaidGameCents) {
+      locks.push({
+        code: 'unpaid',
+        message: `This could add ${money(extraCents)}, and unpaid game charges would pass her limit of ${money(rules.maxUnpaidGameCents)}. Pay ${money(owed + extraCents - rules.maxUnpaidGameCents)} toward the debt first.`,
+      });
+    }
+  }
+  return locks;
+}
+
+export function standingView(sub, today) {
+  const rules = sub.standing || defaultStanding();
+  return {
+    rules,
+    provenPaidCents: provenPaidCents(sub.entries || []),
+    unpaidGameCents: unpaidGameCents(sub.entries || []),
+    missed: missedMinimum(sub, today),
+    locks: gameLocks(sub, today).map((lock) => lock.message),
+  };
 }
 
 /** Drops the oldest plays from earlier days once the list is long. Today's plays stay so the daily cap holds. */
@@ -462,6 +580,7 @@ export function upgradeSub(sub) {
   if (!sub.games || typeof sub.games !== 'object') sub.games = {};
   if (!Array.isArray(sub.plays)) sub.plays = [];
   if (!sub.atm) sub.atm = newAtm(sub.purseCapCents || 0, sub.purseDrawnCents || 0);
+  sub.standing = normalizeStanding({}, { ...defaultStanding(), ...(sub.standing || {}) });
   delete sub.purseCapCents;
   delete sub.purseDrawnCents;
   return sub;
@@ -506,6 +625,7 @@ export function gameView(sub, key, now, today) {
     odds: key === 'slot' ? slotOdds(game.terms, limits.perPlayCapCents) : atmOdds(game.terms),
     todayCents,
     leftTodayCents: Math.max(limits.dailyCapCents - todayCents, 0),
+    locks: gameLocks(sub, today).map((lock) => lock.message),
     nextPlayAt: nextMs > now.getTime() ? new Date(nextMs).toISOString() : null,
     plays: plays.slice(-25),
   };

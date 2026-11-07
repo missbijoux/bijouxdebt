@@ -122,8 +122,10 @@ test('both sides share one book, and a sample checkout writes a real line withou
       amountCents: 2_000,
       purpose: 'debt',
       note: 'sent on Cash App',
+      reference: '#CA-77812',
     });
     assert.equal(claim.json.sub.entries.at(-1).status, 'pending');
+    assert.equal(claim.json.sub.entries.at(-1).reference, '#CA-77812');
     const confirmed = await studio.call(port, 'POST', '/api/studio/claim', {
       entryId: claim.json.sub.entries.at(-1).id,
       decision: 'confirm',
@@ -531,9 +533,128 @@ test('an older book carries the purse ceiling into the ATM', async () => {
   }
 });
 
+function tinyPng() {
+  const chunk = (type, data = Buffer.alloc(0)) => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    return Buffer.concat([length, Buffer.from(type, 'latin1'), data, Buffer.alloc(4)]);
+  };
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', Buffer.alloc(13, 1)),
+    chunk('tEXt', Buffer.from('Comment\0taken at home GPS')),
+    chunk('IDAT', Buffer.from('pixels')),
+    chunk('IEND'),
+  ]);
+}
+
+test('claims need a transaction ID or a screenshot, and only he and she can see the screenshot', async () => {
+  const t = await boot();
+  try {
+    const { alice, bob, studio } = await signedPair(t);
+    const port = t.port;
+    const bare = await alice.call(port, 'POST', '/api/me/claim', { amountCents: 2_000, purpose: 'tribute', note: 'cash app' });
+    assert.equal(bare.status, 400);
+    assert.match(bare.json.error, /transaction ID, a screenshot/);
+    const fake = await alice.call(port, 'POST', '/api/me/claim', {
+      amountCents: 2_000,
+      purpose: 'tribute',
+      screenshot: { type: 'image/png', data: Buffer.from('<svg onload=alert(1)>').toString('base64') },
+    });
+    assert.equal(fake.status, 400);
+
+    const claimed = await alice.call(port, 'POST', '/api/me/claim', {
+      amountCents: 2_000,
+      purpose: 'tribute',
+      note: 'cash app',
+      screenshot: { type: 'image/png', data: tinyPng().toString('base64') },
+    });
+    assert.equal(claimed.status, 200);
+    const entry = claimed.json.sub.entries.at(-1);
+    assert.deepEqual([entry.status, entry.reference, entry.screenshot.type], ['pending', null, 'image/png']);
+
+    const raw = (who) => fetch(`http://127.0.0.1:${port}/api/proof/${entry.id}`, { headers: who ? { cookie: who.cookie() } : {} });
+    const own = await raw(alice);
+    assert.equal(own.status, 200);
+    assert.equal(own.headers.get('content-type'), 'image/png');
+    assert.match(own.headers.get('content-security-policy'), /sandbox/);
+    const bytes = Buffer.from(await own.arrayBuffer());
+    assert.equal(bytes.includes('GPS'), false);
+    assert.equal(bytes.includes('pixels'), true);
+    assert.equal((await raw(studio)).status, 200);
+    assert.equal((await raw(bob)).status, 404);
+    assert.equal((await raw(null)).status, 401);
+  } finally {
+    await t.close();
+  }
+});
+
+test('games stay locked until real money arrives, and for holds, missed minimums, and unpaid game charges', async () => {
+  const t = await boot();
+  try {
+    const { alice, studio, aliceId } = await signedPair(t);
+    const port = t.port;
+    await studio.call(port, 'POST', '/api/studio/debt', { subId: aliceId, principalCents: 10_000, apr: 0, minPaymentCents: 5_000, dueDay: 15 });
+    await alice.call(port, 'POST', '/api/me/sign');
+    await studio.call(port, 'POST', '/api/studio/game', { subId: aliceId, game: 'slot', terms: SLOT });
+    await alice.call(port, 'POST', '/api/me/game/accept', { game: 'slot', version: 1 });
+    const spin = () => alice.call(port, 'POST', '/api/me/game/play', { game: 'slot', playId: playId() });
+    const cool = () => t.later(31_000);
+
+    assert.equal((await alice.call(port, 'POST', '/api/studio/standing', { subId: aliceId, hold: true })).status, 401);
+    const rules = await studio.call(port, 'POST', '/api/studio/standing', { subId: aliceId, minPaidCents: 5_000, maxUnpaidGameCents: 4_000 });
+    assert.equal(rules.status, 200);
+    assert.deepEqual(rules.json.sub.standing.rules, { hold: false, lockWhenOverdue: true, minPaidCents: 5_000, maxUnpaidGameCents: 4_000 });
+    assert.match(rules.json.sub.entries.at(-1).note, /Games need \$50\.00 paid first/);
+
+    const unproven = await spin();
+    assert.equal(unproven.status, 423);
+    assert.match(unproven.json.error, /\$50\.00 more is paid/);
+
+    const sample = await alice.call(port, 'POST', '/api/checkout', { amountCents: 5_000, purpose: 'tribute', note: 'sample' });
+    await alice.call(port, 'POST', `/api/checkout/${sample.json.id}/simulate`);
+    assert.equal((await spin()).status, 423);
+
+    const claim = await alice.call(port, 'POST', '/api/me/claim', { amountCents: 5_000, purpose: 'tribute', reference: 'CA-1' });
+    assert.equal((await spin()).status, 423);
+    await studio.call(port, 'POST', '/api/studio/claim', { entryId: claim.json.sub.entries.at(-1).id, decision: 'confirm' });
+    const first = await spin();
+    assert.equal(first.status, 200);
+    assert.equal(first.json.sub.standing.unpaidGameCents, first.json.play.amountCents);
+
+    cool();
+    const over = await spin();
+    assert.equal(over.status, 423);
+    assert.match(over.json.error, /would pass her limit of \$40\.00/);
+    await studio.call(port, 'POST', '/api/studio/payment', { subId: aliceId, amountCents: 2_000, purpose: 'debt' });
+    const second = await spin();
+    assert.equal(second.status, 200);
+
+    cool();
+    await studio.call(port, 'POST', '/api/studio/standing', { subId: aliceId, hold: true });
+    const held = await spin();
+    assert.equal(held.status, 423);
+    assert.match(held.json.error, /on hold/);
+    const lifted = await studio.call(port, 'POST', '/api/studio/standing', { subId: aliceId, hold: false, maxUnpaidGameCents: 0 });
+    assert.match(lifted.json.sub.entries.at(-1).note, /hold on games is lifted\. No limit on unpaid game charges/);
+
+    t.clock.current = new Date('2026-03-16T12:00:00.000Z');
+    const overdue = await spin();
+    assert.equal(overdue.status, 423);
+    assert.match(overdue.json.error, /\$50\.00 minimum due 2026-03-15 was missed\. Pay \$30\.00/);
+    await studio.call(port, 'POST', '/api/studio/payment', { subId: aliceId, amountCents: 3_000, purpose: 'debt' });
+    const caughtUp = await spin();
+    assert.equal(caughtUp.status, 200);
+    assert.deepEqual(caughtUp.json.sub.standing.locks, []);
+  } finally {
+    await t.close();
+  }
+});
+
 function jar() {
   let cookie = '';
   return {
+    cookie: () => cookie,
     async call(port, method, urlPath, body, headers = {}) {
       const res = await fetch(`http://127.0.0.1:${port}${urlPath}`, {
         method,
