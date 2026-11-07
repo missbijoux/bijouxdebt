@@ -162,7 +162,7 @@ code { word-break: break-all; color: var(--gold-2); }
 .site-link { color: var(--muted); }
 footer { margin-top: 40px; color: var(--muted); display: grid; gap: 8px; }
 .spaced { margin-top: 36px; }
-main > .panel, main > section { margin-bottom: 18px; }
+main > .panel, main > section, main > .grid { margin-bottom: 18px; }
 .panel form, .panel .accept { margin-top: 18px; }
 .form-error, .form-notice { margin: 12px 0 0; }
 details > summary { cursor: pointer; color: var(--gold-2); margin: 12px 0; }
@@ -198,6 +198,7 @@ input.small { width: 6.5rem; min-height: 40px; padding: 8px 10px; }
 .small-btn { min-height: 34px; padding: 6px 12px; font-size: 0.85rem; }
 .preview { border-top: 1px dashed var(--line); margin-top: 18px; padding-top: 12px; }
 .panel.locked { border-color: rgba(255, 180, 180, 0.55); background: linear-gradient(180deg, rgba(255, 180, 180, 0.08), transparent 40%), var(--card); }
+.panel > .grid + .notice, .panel > .grid + .warning { margin-top: 12px; }
 .locked-now { background: #3a171c; border-radius: 10px; padding: 10px 12px; margin: 12px 0; }
 .locked-now .kicker { margin: 0 0 4px; }
 .lock-list { margin: 8px 0 12px; padding-left: 1.2rem; display: grid; gap: 6px; color: var(--danger); line-height: 1.45; }

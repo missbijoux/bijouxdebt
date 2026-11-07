@@ -116,7 +116,7 @@ async function api(path, options = {}) {
     body: options.body == null ? undefined : JSON.stringify(options.body),
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || 'The book could not do that.');
+  if (!response.ok) throw Object.assign(new Error(data.error || 'The book could not do that.'), { status: response.status });
   return data;
 }
 
@@ -222,6 +222,14 @@ function pendingPlayId(name) {
   heldPlays[name] ||= randomHex();
   try { sessionStorage.setItem(`bijouxdebt-play-${name}`, heldPlays[name]); } catch { /* held in memory */ }
   return heldPlays[name];
+}
+
+/**
+ * The server looked the id up and turned the play down, so nothing is saved under it.
+ * Sign-in and rate limits answer before that lookup, and a network error or 5xx might follow a save, so those keep the id.
+ */
+function refused(error) {
+  return error.status >= 400 && error.status < 500 && ![401, 408, 429].includes(error.status);
 }
 
 function hasPendingPlay(name) {
@@ -1182,6 +1190,7 @@ async function spin() {
     }
     state.sub = result.sub;
   } catch (error) {
+    if (refused(error)) clearPendingPlay('slot');
     state.formError = { key: 'slot-play', message: error.message };
   }
   state.spin = { busy: false, stopped: 0 };
@@ -1427,6 +1436,7 @@ function standingPanel(sub) {
   const standing = sub.standing;
   const rules = standing.rules;
   const missed = standing.missed;
+  const slotOnly = (sub.games.slot?.locks || []).filter((message) => !standing.locks.includes(message));
   return el('section', { class: 'panel', id: 'standing' },
     el('h2', null, 'Who can play'),
     el('p', { class: 'muted' }, 'These rules only lock games, so he does not have to accept them again. Only real money counts: Lightning that settled, payments you record, and claims you confirm. Sample checkouts never count.'),
@@ -1438,6 +1448,7 @@ function standingPanel(sub) {
     standing.locks.length
       ? el('div', { class: 'locked-now' }, el('p', { class: 'kicker' }, 'Locked now'), el('ul', { class: 'lock-list' }, ...standing.locks.map((message) => el('li', null, message))))
       : el('p', { class: 'notice' }, 'Games are open for this name.'),
+    slotOnly.length ? el('p', { class: 'warning' }, `The slot is still locked, since one spin can cost more than the room left. ${slotOnly[0]}`) : null,
     form(`standing-${sub.id}`, (event) => saveStanding(event, sub.id),
       field('Hold', el('span', { class: 'row' }, el('input', { name: 'hold', type: 'checkbox', checked: rules.hold }), 'Hold all games for this name')),
       field('Missed minimum', el('span', { class: 'row' }, el('input', { name: 'lockWhenOverdue', type: 'checkbox', checked: rules.lockWhenOverdue }), 'Lock games when a minimum payment is missed')),
@@ -1789,6 +1800,7 @@ async function withdraw(subId, option, amountCents) {
     clearPendingPlay(`atm-${subId}`);
     Object.assign(ui, { result: result.play, phase: 'cash' });
   } catch (error) {
+    if (refused(error)) clearPendingPlay(`atm-${subId}`);
     if (/Insert the card/.test(error.message)) Object.assign(ui, { phase: 'idle', cardToken: null });
     throw error;
   } finally {
