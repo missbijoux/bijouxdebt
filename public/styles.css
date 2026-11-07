@@ -284,6 +284,9 @@ input[type="file"] { padding: 9px 12px; }
 .reel.landed { animation: reel-land 0.45s cubic-bezier(0.2, 1.6, 0.4, 1); border-color: var(--blush); }
 .slot-result { font-size: 1.3rem; font-weight: 600; min-height: 1.6em; }
 .btn.spin { min-width: 260px; font-size: 1.1rem; }
+.play-stop { background: #2a0c12; border: 1px solid rgba(255, 154, 168, 0.55); border-left: 4px solid var(--danger); padding: 14px 16px; margin: 16px auto 4px; max-width: 620px; text-align: left; }
+.play-stop p { margin: 0 0 10px; color: var(--danger); }
+.play-stop .play-stop-title { font-size: 1.15rem; font-weight: 700; color: var(--ink); }
 @keyframes reel-spin { from { transform: translateY(0); } to { transform: translateY(-50%); } }
 @keyframes reel-land { from { transform: translateY(-22px); } to { transform: translateY(0); } }
 
