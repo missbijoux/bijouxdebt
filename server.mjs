@@ -6,9 +6,12 @@ import QRCode from 'qrcode';
 import {
   acceptGame,
   assertPlayable,
+  ATM_OPTIONS,
   atmLocked,
   atmOdds,
   atmView,
+  defaultAtmTerms,
+  defaultSlotTerms,
   drawKick,
   drawSkim,
   drawSlot,
@@ -23,6 +26,7 @@ import {
   setSubLimits,
   slotOdds,
   slotOutcomeIndex,
+  SLOT_SYMBOLS,
   trimPlays,
   upgradeSub,
 } from './games.mjs';
@@ -752,6 +756,7 @@ export function createServer(options = {}) {
           return {
             checkout: ohm.mode(),
             tiers: book.settings.tiers,
+            defaults: { slot: defaultSlotTerms(), atm: defaultAtmTerms(), symbols: SLOT_SYMBOLS },
             month,
             sentThisMonthCents: book.subs.reduce((sum, sub) => sum + monthSent(sub, month), 0),
             subs: book.subs
@@ -989,7 +994,7 @@ export function createServer(options = {}) {
         const body = await readBody(req);
         const playId = playIdOf(body.playId);
         const option = body.option;
-        if (!['amount', 'quick', 'skim', 'kick'].includes(option)) throw new HttpError(400, 'Pick an amount or a quick option.');
+        if (!ATM_OPTIONS.includes(option)) throw new HttpError(400, 'Pick an amount or a quick option.');
         return store.update((book) => {
           const sub = findSub(book, body.subId);
           const prior = priorPlay(sub, playId, 'atm');
