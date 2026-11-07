@@ -116,7 +116,7 @@ async function api(path, options = {}) {
     body: options.body == null ? undefined : JSON.stringify(options.body),
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || 'The book could not do that.');
+  if (!response.ok) throw Object.assign(new Error(data.error || 'The book could not do that.'), { status: response.status });
   return data;
 }
 
@@ -164,7 +164,7 @@ function keepValues(formNode) {
     if (!next || next.elements.length !== saved.length) return;
     [...next.elements].forEach((node, index) => {
       const [name, value] = saved[index];
-      if (!name || node.name !== name || node.type === 'password') return;
+      if (!name || node.name !== name || node.type === 'password' || node.type === 'file') return;
       if (node.type === 'checkbox') node.checked = value;
       else node.value = value;
     });
@@ -222,6 +222,14 @@ function pendingPlayId(name) {
   heldPlays[name] ||= randomHex();
   try { sessionStorage.setItem(`bijouxdebt-play-${name}`, heldPlays[name]); } catch { /* held in memory */ }
   return heldPlays[name];
+}
+
+/**
+ * The server looked the id up and turned the play down, so nothing is saved under it.
+ * Sign-in and rate limits answer before that lookup, and a network error or 5xx might follow a save, so those keep the id.
+ */
+function refused(error) {
+  return error.status >= 400 && error.status < 500 && ![401, 408, 429].includes(error.status);
 }
 
 function hasPendingPlay(name) {
@@ -442,6 +450,9 @@ function book() {
           field('Amount', el('input', { name: 'amount', inputmode: 'decimal', required: true, placeholder: '0.00' })),
           field('Toward', el('select', { name: 'purpose' }, el('option', { value: 'debt' }, 'Debt'), el('option', { value: 'tribute' }, 'Tribute'))),
           field('Note', el('input', { name: 'note', maxlength: 140, placeholder: 'Cash App, throne, cash' })),
+          el('p', { class: 'muted' }, 'A payment made outside Lightning needs its transaction ID, a screenshot of it, or both. Crop out account numbers first. Lightning payments need no proof: they write themselves in when they settle.'),
+          field('Transaction ID', el('input', { name: 'reference', maxlength: 100, autocomplete: 'off' })),
+          field('Screenshot, PNG or JPEG up to 3 MB', el('input', { name: 'screenshot', type: 'file', accept: 'image/png,image/jpeg' })),
           el('button', { class: 'btn secondary', type: 'submit' }, 'Submit the claim'),
         ),
       ),
@@ -546,7 +557,11 @@ function feed(sub) {
   return el('section', null,
     el('h2', null, 'The lines'),
     lines.length ? el('ol', { class: 'feed' }, lines.map((entry) => el('li', null,
-      el('span', null, `${prettyDay(entry.nyDay)} · ${KIND[entry.kind] || entry.kind} · ${entry.note || ''}${entry.status === 'confirmed' ? '' : ` · ${entry.status}`}`),
+      el('span', null,
+        `${prettyDay(entry.nyDay)} · ${KIND[entry.kind] || entry.kind} · ${entry.note || ''}${entry.status === 'confirmed' ? '' : ` · ${entry.status}`}`,
+        entry.reference ? ` · ID ${entry.reference}` : '',
+        entry.screenshot ? [' · ', proofLink(entry, 'Screenshot')] : null,
+      ),
       entry.amountCents ? el('strong', null, money(entry.amountCents)) : null,
     ))) : el('p', { class: 'muted' }, 'No lines yet.'),
   );
@@ -606,7 +621,7 @@ function studioCard(sub) {
     el('p', { class: 'muted' }, `Ask ${money(sub.askCents)}. ATM ${money(sub.atm.balanceCents)} left of ${money(sub.atm.loadedCents)} loaded${sub.atm.frozen ? ', frozen' : ''}. This month ${money(sub.monthCents)}.`),
     el('p', { class: 'row' },
       el('a', { class: 'btn secondary', href: `#/studio/games/${sub.id}` }, 'Slot machine and ATM'),
-      el('span', { class: 'muted' }, `Slot: ${sub.games.slot ? GAME_STATUS[sub.games.slot.status].toLowerCase() : 'not set up'}. ATM: ${sub.games.atm ? GAME_STATUS[sub.games.atm.status].toLowerCase() : 'no terms yet'}.`),
+      el('span', { class: 'muted' }, `Slot: ${sub.games.slot ? GAME_STATUS[sub.games.slot.status].toLowerCase() : 'not set up'}. ATM: ${sub.games.atm ? GAME_STATUS[sub.games.atm.status].toLowerCase() : 'no terms yet'}.${sub.standing.locks.length ? ' Games are locked.' : ''}`),
     ),
     form(`debt-${sub.id}`, (event) => proposeDebt(event, sub.id),
       el('h3', null, 'Write a debt'),
@@ -653,11 +668,21 @@ function studioCard(sub) {
 function claims(sub) {
   const pending = (sub.entries || []).filter((entry) => entry.status === 'pending');
   if (!pending.length) return null;
-  return el('div', null, el('h3', null, 'Claims'), ...pending.map((entry) => el('div', { class: 'row' },
-    el('span', null, `${money(entry.amountCents)} ${entry.purpose} · ${entry.note}`),
-    el('button', { class: 'btn', type: 'button', onclick: () => decideClaim(entry.id, 'confirm') }, 'Confirm'),
-    el('button', { class: 'btn danger', type: 'button', onclick: () => decideClaim(entry.id, 'reject') }, 'Reject'),
+  return el('div', null, el('h3', null, 'Claims'), ...pending.map((entry) => el('div', { class: 'claim' },
+    el('p', null, el('strong', null, `${money(entry.amountCents)} ${entry.purpose}`), entry.note ? ` · ${entry.note}` : ''),
+    el('p', null, entry.reference ? ['Transaction ID ', el('code', null, entry.reference)] : el('span', { class: 'muted' }, 'No transaction ID')),
+    entry.screenshot
+      ? proofLink(entry, el('img', { class: 'proof-thumb', src: `${BASE}/api/proof/${entry.id}`, alt: 'Payment screenshot' }))
+      : el('p', { class: 'muted' }, 'No screenshot'),
+    el('div', { class: 'row' },
+      el('button', { class: 'btn', type: 'button', onclick: () => decideClaim(entry.id, 'confirm') }, 'Confirm'),
+      el('button', { class: 'btn danger', type: 'button', onclick: () => decideClaim(entry.id, 'reject') }, 'Reject'),
+    ),
   )));
+}
+
+function proofLink(entry, content) {
+  return el('a', { href: `${BASE}/api/proof/${entry.id}`, target: '_blank', rel: 'noopener' }, content);
 }
 
 function verdicts(sub) {
@@ -764,11 +789,29 @@ async function simulate() {
   }
 }
 
+const PROOF_MAX_BYTES = 3 * 1024 * 1024;
+
+async function fileBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = '';
+  for (let start = 0; start < bytes.length; start += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(start, start + 0x8000));
+  }
+  return btoa(binary);
+}
+
 async function claimPayment(event) {
   const data = Object.fromEntries(new FormData(event.target));
+  const amountCents = dollarsToCents(data.amount);
+  const reference = String(data.reference || '').trim();
+  const file = data.screenshot?.size ? data.screenshot : null;
+  if (!reference && !file) throw new Error('Add the transaction ID, a screenshot, or both.');
+  if (file && !['image/png', 'image/jpeg'].includes(file.type)) throw new Error('The screenshot must be a PNG or JPEG.');
+  if (file && file.size > PROOF_MAX_BYTES) throw new Error('The screenshot is over 3 MB. Crop it or save it smaller, then try again.');
+  const screenshot = file ? { type: file.type, data: await fileBase64(file) } : null;
   await refreshSub(await api('/api/me/claim', {
     method: 'POST',
-    body: { amountCents: dollarsToCents(data.amount), purpose: data.purpose, note: data.note },
+    body: { amountCents, purpose: data.purpose, note: data.note, reference, screenshot },
   }));
 }
 
@@ -1055,10 +1098,22 @@ function games() {
       figure('Debt', debt ? money(debt.balanceCents) : 'None', debt?.status === 'active' ? 'Games add here' : 'Games need an active signed debt'),
       figure('ATM', money(sub.atm.balanceCents), sub.atm.frozen ? 'Frozen' : `Loaded ${money(sub.atm.loadedCents)} in all`),
     ),
+    locksPanel(sub),
     slotPanel(sub),
     atmPanel(sub),
   );
   watchLive();
+}
+
+function locksPanel(sub) {
+  const locks = sub.standing?.locks || [];
+  if (!locks.length) return null;
+  return el('section', { class: 'panel locked', id: 'locks' },
+    el('h2', null, 'Games are locked'),
+    el('ul', { class: 'lock-list' }, ...locks.map((message) => el('li', null, message))),
+    el('p', { class: 'muted' }, 'She sets these rules. They lift on their own once the payment is in the book. Sample checkouts never count.'),
+    el('a', { class: 'btn secondary', href: '#/book' }, 'Pay or claim a payment'),
+  );
 }
 
 function slotPanel(sub) {
@@ -1073,6 +1128,7 @@ function slotPanel(sub) {
   const cooling = game.nextPlayAt && Date.parse(game.nextPlayAt) > Date.now();
   let blocked = '';
   if (sub.debt?.status !== 'active') blocked = 'Games only add to an active signed debt, and none is running.';
+  else if (game.locks?.length) blocked = game.locks[0];
   else if (game.pausedBySub) blocked = 'You paused this game.';
   else if (cooling) blocked = `Cooling down until ${clock(game.nextPlayAt)}.`;
   else if (game.leftTodayCents < game.odds.maxChargeCents) blocked = `Today's cap is reached. ${money(game.leftTodayCents)} is left, and a spin can cost ${money(game.odds.maxChargeCents)}.`;
@@ -1134,6 +1190,7 @@ async function spin() {
     }
     state.sub = result.sub;
   } catch (error) {
+    if (refused(error)) clearPendingPlay('slot');
     state.formError = { key: 'slot-play', message: error.message };
   }
   state.spin = { busy: false, stopped: 0 };
@@ -1187,8 +1244,9 @@ function atmPanel(sub) {
   );
 }
 
-function atmStatus(atm) {
+function atmStatus(atm, locks) {
   if (atm.frozen) return 'Frozen';
+  if (locks.length) return 'Withdrawals locked';
   if (atm.lockedUntil) return `Card locked until ${clock(atm.lockedUntil)}`;
   if (!atm.pinSet) return 'No card PIN yet';
   return 'Ready';
@@ -1196,11 +1254,13 @@ function atmStatus(atm) {
 
 function atmLive(sub) {
   const atm = sub.atm;
+  const locks = sub.standing?.locks || [];
   return el('div', { class: 'atm', id: 'atm-live' },
     el('div', { class: 'atm-screen', id: 'atm-screen', 'aria-live': 'polite' },
-      el('p', { class: 'kicker' }, atmStatus(atm)),
+      el('p', { class: 'kicker' }, atmStatus(atm, locks)),
       el('p', { class: 'atm-big' }, money(atm.balanceCents)),
       el('p', { class: 'muted' }, `Loaded ${money(atm.loadedCents)} · withdrawn ${money(atm.withdrawnCents)}`),
+      locks.length && !atm.frozen ? el('p', { class: 'muted atm-lock' }, `She cannot withdraw until games unlock. ${locks[0]}`) : null,
     ),
     el('div', { class: 'atm-slots' },
       el('div', { class: 'card-slot', id: 'atm-card' }, el('span', { class: 'atm-card' })),
@@ -1366,9 +1426,57 @@ function studioGames(subId) {
     el('p', { class: 'lede' }, sub.debt?.status === 'active'
       ? `Debt ${money(sub.debt.balanceCents)}. Every result adds to it, and nothing a game does can lower it.`
       : 'Games play only against an active signed debt. Write one and have it signed first.'),
+    standingPanel(sub),
     studioSlot(sub),
     studioAtm(sub),
   );
+}
+
+function standingPanel(sub) {
+  const standing = sub.standing;
+  const rules = standing.rules;
+  const missed = standing.missed;
+  const slotOnly = (sub.games.slot?.locks || []).filter((message) => !standing.locks.includes(message));
+  return el('section', { class: 'panel', id: 'standing' },
+    el('h2', null, 'Who can play'),
+    el('p', { class: 'muted' }, 'These rules only lock games, so he does not have to accept them again. Only real money counts: Lightning that settled, payments you record, and claims you confirm. Sample checkouts never count.'),
+    el('div', { class: 'grid cards' },
+      figure('Paid for real', money(standing.provenPaidCents), rules.minPaidCents ? `Games need ${money(rules.minPaidCents)}` : 'No paid minimum'),
+      figure('Unpaid game charges', money(standing.unpaidGameCents), rules.maxUnpaidGameCents ? `Games lock at ${money(rules.maxUnpaidGameCents)}` : 'No limit'),
+    ),
+    missed ? el('p', { class: 'warning' }, `He missed the ${money(missed.minimumCents)} minimum due ${prettyDay(missed.due)}, ${money(missed.shortCents)} short.`) : null,
+    standing.locks.length
+      ? el('div', { class: 'locked-now' }, el('p', { class: 'kicker' }, 'Locked now'), el('ul', { class: 'lock-list' }, ...standing.locks.map((message) => el('li', null, message))))
+      : el('p', { class: 'notice' }, 'Games are open for this name.'),
+    slotOnly.length ? el('p', { class: 'warning' }, `The slot is still locked, since one spin can cost more than the room left. ${slotOnly[0]}`) : null,
+    form(`standing-${sub.id}`, (event) => saveStanding(event, sub.id),
+      field('Hold', el('span', { class: 'row' }, el('input', { name: 'hold', type: 'checkbox', checked: rules.hold }), 'Hold all games for this name')),
+      field('Missed minimum', el('span', { class: 'row' }, el('input', { name: 'lockWhenOverdue', type: 'checkbox', checked: rules.lockWhenOverdue }), 'Lock games when a minimum payment is missed')),
+      el('div', { class: 'grid cards' },
+        field('Paid before games unlock', el('input', { name: 'minPaid', inputmode: 'decimal', value: dollars(rules.minPaidCents), required: true })),
+        field('Lock at unpaid game charges of', el('input', { name: 'maxUnpaid', inputmode: 'decimal', value: dollars(rules.maxUnpaidGameCents), required: true })),
+      ),
+      el('p', { class: 'muted' }, 'Use 0 to turn either amount off.'),
+      el('button', { class: 'btn', type: 'submit' }, 'Save the rules'),
+    ),
+  );
+}
+
+async function saveStanding(event, subId) {
+  const data = Object.fromEntries(new FormData(event.target));
+  await api('/api/studio/standing', {
+    method: 'POST',
+    body: {
+      subId,
+      hold: data.hold === 'on',
+      lockWhenOverdue: data.lockWhenOverdue === 'on',
+      minPaidCents: dollarsToCents(data.minPaid || '0'),
+      maxUnpaidGameCents: dollarsToCents(data.maxUnpaid || '0'),
+    },
+  });
+  state.studio = await api('/api/studio');
+  state.notice = 'Rules saved.';
+  render();
 }
 
 function statusLine(game) {
@@ -1596,11 +1704,14 @@ function atmMachine(sub) {
       el('button', { class: 'btn secondary', type: 'button', onclick: () => press(key, () => ejectCard(sub.id)) }, 'Eject card'),
     );
   } else {
-    screen = [el('p', { class: 'kicker' }, atm.pinSet ? 'Welcome' : 'No card PIN yet'), el('p', { class: 'atm-big' }, 'Insert card'), el('p', { class: 'muted' }, `${sub.handle}'s machine`)];
+    const locked = sub.standing.locks.length > 0;
+    screen = locked
+      ? [el('p', { class: 'kicker' }, 'Withdrawals locked'), el('p', { class: 'atm-big wrong' }, 'Locked'), el('p', { class: 'muted' }, sub.standing.locks[0])]
+      : [el('p', { class: 'kicker' }, atm.pinSet ? 'Welcome' : 'No card PIN yet'), el('p', { class: 'atm-big' }, 'Insert card'), el('p', { class: 'muted' }, `${sub.handle}'s machine`)];
     controls = el('button', {
       class: 'btn',
       type: 'button',
-      disabled: !atm.pinSet,
+      disabled: !atm.pinSet || locked,
       onclick: () => {
         state.formError = null;
         Object.assign(ui, { phase: 'pin', digits: '' });
@@ -1689,6 +1800,7 @@ async function withdraw(subId, option, amountCents) {
     clearPendingPlay(`atm-${subId}`);
     Object.assign(ui, { result: result.play, phase: 'cash' });
   } catch (error) {
+    if (refused(error)) clearPendingPlay(`atm-${subId}`);
     if (/Insert the card/.test(error.message)) Object.assign(ui, { phase: 'idle', cardToken: null });
     throw error;
   } finally {

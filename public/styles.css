@@ -232,6 +232,26 @@ input.small { width: 7rem; min-height: 44px; padding: 8px 10px; }
 .symbol-pick input.small { width: 5rem; }
 .small-btn { min-height: 40px; padding: 8px 14px; font-size: 0.9rem; }
 .preview { border-top: 1px dashed var(--line); margin-top: 18px; padding-top: 12px; }
+.panel.locked { border-color: rgba(255, 154, 168, 0.55); border-top: 3px solid var(--danger); }
+.panel > .grid + .notice, .panel > .grid + .warning { margin-top: 12px; }
+.locked-now { background: #2a0c12; border-left: 4px solid var(--danger); padding: 12px 14px; margin: 14px 0; }
+.locked-now .kicker { margin: 0 0 4px; }
+.lock-list { margin: 8px 0 12px; padding-left: 1.2rem; display: grid; gap: 6px; color: var(--danger); line-height: 1.45; }
+.locked-now .lock-list { margin-bottom: 0; }
+.atm-screen .atm-lock { margin-top: 8px; color: var(--danger); }
+.claim { padding: 14px 0; border-bottom: 1px solid rgba(245, 239, 224, 0.12); }
+.claim p { margin: 0 0 8px; }
+.proof-thumb {
+  display: block;
+  max-width: 220px;
+  max-height: 260px;
+  width: auto;
+  height: auto;
+  border: 1px solid var(--line);
+  margin: 0 0 10px;
+  background: #0b0b0b;
+}
+input[type="file"] { padding: 9px 12px; }
 
 .slot {
   text-align: center;

@@ -10,16 +10,21 @@ import {
   drawSkim,
   drawSlot,
   effectiveLimits,
+  gameLocks,
   gameStatus,
+  missedMinimum,
   newGame,
   normalizeAtmTerms,
   normalizeSlotTerms,
+  normalizeStanding,
   pickWeighted,
+  provenPaidCents,
   reviseGame,
   setSubLimits,
   slotOdds,
   slotOutcomeIndex,
   trimPlays,
+  unpaidGameCents,
   upgradeSub,
 } from './games.mjs';
 import { LIMITS } from './ledger.mjs';
@@ -201,4 +206,74 @@ test('an older book moves the purse into the ATM, and old plays trim without los
   trimPlays(plays, TODAY);
   assert.equal(plays.length, LIMITS.maxPlays + 2);
   assert.ok(plays.every((play) => play.nyDay === TODAY));
+});
+
+const paid = (amountCents, extra = {}) => ({ kind: 'payment', status: 'confirmed', method: 'manual', amountCents, appliedDebtCents: amountCents, nyDay: TODAY, ...extra });
+const charge = (amountCents) => ({ kind: 'game', status: 'confirmed', amountCents, nyDay: TODAY });
+
+test('only real, confirmed money counts as paid, and payments clear game charges in book order', () => {
+  const entries = [
+    paid(1_000, { method: 'sandbox' }),
+    paid(2_000, { status: 'pending' }),
+    paid(3_000, { status: 'rejected' }),
+    paid(500, { method: 'ohm' }),
+    { kind: 'tribute', status: 'confirmed', method: 'manual', amountCents: 700, appliedDebtCents: 0, nyDay: TODAY },
+  ];
+  assert.equal(provenPaidCents(entries), 1_200);
+
+  assert.equal(unpaidGameCents([paid(5_000), charge(2_000), charge(1_500)]), 3_500);
+  assert.equal(unpaidGameCents([charge(2_000), paid(500), charge(1_000), paid(4_000)]), 0);
+  assert.equal(unpaidGameCents([charge(2_000), paid(1_500, { method: 'sandbox' })]), 2_000);
+  assert.equal(unpaidGameCents([charge(2_000), { kind: 'tribute', status: 'confirmed', amountCents: 5_000, appliedDebtCents: 0 }]), 2_000);
+  assert.equal(unpaidGameCents([charge(2_000), { kind: 'forgive', amountCents: 9_000 }, charge(300)]), 300);
+  assert.equal(unpaidGameCents([charge(2_000), { kind: 'settled', amountCents: 9_000 }, charge(300)]), 2_300);
+});
+
+test('a missed minimum stays missed until real payments since the prior due date cover it', () => {
+  const sub = {
+    debt: { status: 'active', balanceCents: 10_000, minPaymentCents: 2_000, dueDay: 15, signedAt: '2026-02-20T15:00:00.000Z' },
+    entries: [paid(500, { nyDay: '2026-02-10' }), paid(800, { nyDay: '2026-03-01' })],
+  };
+  assert.equal(missedMinimum(sub, '2026-03-15'), null);
+  assert.deepEqual(missedMinimum(sub, '2026-03-16'), { due: '2026-03-15', minimumCents: 2_000, shortCents: 1_200 });
+  sub.entries.push(paid(1_200, { method: 'sandbox', nyDay: '2026-03-17' }));
+  assert.equal(missedMinimum(sub, '2026-03-18').shortCents, 1_200);
+  sub.entries.push(paid(1_200, { nyDay: '2026-03-18' }));
+  assert.equal(missedMinimum(sub, '2026-03-18'), null);
+
+  const fresh = { ...sub, debt: { ...sub.debt, signedAt: '2026-03-16T15:00:00.000Z' }, entries: [] };
+  assert.equal(missedMinimum(fresh, '2026-03-20'), null);
+  assert.equal(missedMinimum({ ...sub, debt: { ...sub.debt, minPaymentCents: 0 } }, '2026-03-20'), null);
+});
+
+test('her payment rules lock every game, and a play can never carry him past the unpaid limit', () => {
+  const sub = playableSub();
+  sub.entries = [];
+  sub.standing = normalizeStanding({ minPaidCents: 3_000, maxUnpaidGameCents: 4_000 });
+  assert.equal(sub.standing.lockWhenOverdue, true);
+  assert.deepEqual(gameLocks(sub, TODAY).map((lock) => lock.code), ['unproven']);
+  assert.throws(() => assertPlayable({ sub, key: 'slot', maxChargeCents: 1_000, now: NOW, today: TODAY }), (error) => {
+    assert.equal(error.status, 423);
+    assert.match(error.message, /\$30\.00 more is paid/);
+    return true;
+  });
+
+  sub.entries.push(paid(1_000, { method: 'sandbox' }));
+  assert.match(gameLocks(sub, TODAY)[0].message, /\$30\.00 more/);
+  sub.entries.push(paid(3_000));
+  assert.deepEqual(gameLocks(sub, TODAY), []);
+
+  sub.entries.push(charge(3_500));
+  assert.deepEqual(gameLocks(sub, TODAY), []);
+  assert.equal(gameLocks(sub, TODAY, 500).length, 0);
+  assert.match(gameLocks(sub, TODAY, 501)[0].message, /would pass her limit of \$40\.00/);
+  sub.entries.push(charge(500));
+  assert.match(gameLocks(sub, TODAY)[0].message, /at her limit/);
+  sub.entries.push(paid(1_000));
+  assert.deepEqual(gameLocks(sub, TODAY), []);
+
+  sub.standing = normalizeStanding({ hold: true }, sub.standing);
+  assert.equal(gameLocks(sub, TODAY)[0].code, 'hold');
+  assert.throws(() => normalizeStanding({ minPaidCents: -1 }), /paid minimum/);
+  assert.throws(() => normalizeStanding({ maxUnpaidGameCents: 1.5 }), /unpaid limit/);
 });

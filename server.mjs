@@ -1,5 +1,5 @@
 import { createServer as createHttpServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import QRCode from 'qrcode';
@@ -21,17 +21,20 @@ import {
   GAMES,
   gameView,
   newGame,
+  normalizeStanding,
   normalizeTerms,
   reviseGame,
   setSubLimits,
   slotOdds,
   slotOutcomeIndex,
   SLOT_SYMBOLS,
+  standingView,
   trimPlays,
   upgradeSub,
 } from './games.mjs';
 import { accrue, applyConfirmedPayment, LIMITS, money, nextDueLabel, nyDate } from './ledger.mjs';
 import { createOhm } from './ohm.mjs';
+import { cleanScreenshot, PROOF_TYPES, ProofError, referenceOf } from './proof.mjs';
 import { createStore, hashSecret, newId, TITLES, verifySecret } from './store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -121,6 +124,7 @@ function privateSub(sub, now) {
       slot: gameView(sub, 'slot', now, nyDate(now)),
       atm: gameView(sub, 'atm', now, nyDate(now)),
     },
+    standing: standingView(sub, nyDate(now)),
     atm: atmView(sub.atm, now),
     entries: sub.entries.slice(-200),
   };
@@ -252,12 +256,12 @@ function monthSent(sub, month) {
   }, 0);
 }
 
-async function readBody(req) {
+async function readBody(req, maxBytes = 20_000) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 20_000) throw new HttpError(413, 'That request is too large.');
+    if (size > maxBytes) throw new HttpError(413, 'That request is too large.');
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
@@ -290,6 +294,7 @@ export function createServer(options = {}) {
   const base = options.basePath ?? basePath();
   const dataFile = options.dataFile || path.join(__dirname, 'data', 'book.json');
   const store = options.store || createStore(dataFile);
+  const proofDir = options.proofDir || path.join(path.dirname(dataFile), 'proofs');
   const ohm = options.ohm || createOhm();
   const pin = options.pin ?? process.env.BIJOUX_STUDIO_PIN ?? '';
   let pinHash = null;
@@ -472,19 +477,25 @@ export function createServer(options = {}) {
         });
       },
       'POST /api/me/claim': async () => {
+        limit(`claim:${ip}`, 10, 15 * 60 * 1000);
         const session = requireSub(data(), token, now);
-        const body = await readBody(req);
+        const body = await readBody(req, 4_300_000);
         const amount = cents(body.amountCents, LIMITS.minCheckoutCents, LIMITS.maxCheckoutCents, 'A claim');
         const purpose = body.purpose === 'debt' ? 'debt' : 'tribute';
         const text = noteOf(body.note) || 'Claimed outside the book';
-        return store.update((book) => {
+        const reference = referenceOf(body.reference);
+        const screenshot = body.screenshot ? cleanScreenshot(body.screenshot) : null;
+        if (!reference && !screenshot) {
+          throw new HttpError(400, 'Add the transaction ID, a screenshot of the payment, or both.');
+        }
+        return store.update(async (book) => {
           const sub = findSub(book, session.subId);
           if (purpose === 'debt' && sub.debt?.status !== 'active') {
             throw new HttpError(400, 'A debt payment can be claimed only after you sign a debt.');
           }
           const pending = sub.entries.filter((entry) => entry.status === 'pending').length;
           if (pending >= 5) throw new HttpError(400, 'Wait for her to answer the claims already waiting.');
-          pushEntry(sub, stampEntry({
+          const entry = pushEntry(sub, stampEntry({
             kind: 'payment',
             amountCents: amount,
             purpose,
@@ -492,7 +503,13 @@ export function createServer(options = {}) {
             source: 'sub',
             method: 'manual',
             note: text,
+            reference: reference || null,
+            screenshot: screenshot ? { type: screenshot.type, bytes: screenshot.bytes.length } : null,
           }, now));
+          if (screenshot) {
+            await mkdir(proofDir, { recursive: true });
+            await writeFile(path.join(proofDir, `${entry.id}.${PROOF_TYPES[screenshot.type]}`), screenshot.bytes);
+          }
           return { sub: privateSub(sub, now) };
         });
       },
@@ -945,6 +962,31 @@ export function createServer(options = {}) {
         const terms = normalizeTerms(key, body.terms);
         return { odds: key === 'slot' ? slotOdds(terms, terms.perPlayCapCents) : atmOdds(terms) };
       },
+      'POST /api/studio/standing': async () => {
+        requireStudio(data(), token, now);
+        const body = await readBody(req);
+        return store.update((book) => {
+          const sub = findSub(book, body.subId);
+          const before = sub.standing;
+          const next = normalizeStanding(body, before);
+          sub.standing = next;
+          const changes = [];
+          if (next.hold !== before.hold) changes.push(next.hold ? 'Games are on hold' : 'The hold on games is lifted');
+          if (next.lockWhenOverdue !== before.lockWhenOverdue) {
+            changes.push(next.lockWhenOverdue ? 'A missed minimum locks games' : 'A missed minimum no longer locks games');
+          }
+          if (next.minPaidCents !== before.minPaidCents) {
+            changes.push(next.minPaidCents ? `Games need ${money(next.minPaidCents)} paid first` : 'No paid minimum for games');
+          }
+          if (next.maxUnpaidGameCents !== before.maxUnpaidGameCents) {
+            changes.push(next.maxUnpaidGameCents ? `Games lock at ${money(next.maxUnpaidGameCents)} in unpaid game charges` : 'No limit on unpaid game charges');
+          }
+          if (changes.length) {
+            pushEntry(sub, stampEntry({ kind: 'note', amountCents: 0, source: 'domme', note: `${changes.join('. ')}.` }, now));
+          }
+          return { sub: privateSub(sub, now) };
+        });
+      },
       'POST /api/studio/atm/pin': async () => {
         requireStudio(data(), token, now);
         const body = await readBody(req);
@@ -1104,8 +1146,37 @@ export function createServer(options = {}) {
 
     const dynamic = pathname.match(/^\/api\/checkout\/([a-f0-9]+)$/);
     const simulate = pathname.match(/^\/api\/checkout\/([a-f0-9]+)\/simulate$/);
+    const proof = pathname.match(/^\/api\/proof\/([a-f0-9]{16})$/);
 
     try {
+      if (proof && req.method === 'GET') {
+        const session = sessionFrom(data(), token, now);
+        if (!session) throw new HttpError(401, 'Sign in to see this.');
+        const owner = data().subs.find((sub) => sub.entries.some((entry) => entry.id === proof[1]));
+        const entry = owner?.entries.find((item) => item.id === proof[1]);
+        if (!entry?.screenshot || (session.role !== 'studio' && owner.id !== session.subId)) {
+          throw new HttpError(404, 'That screenshot is not in the book.');
+        }
+        const ext = PROOF_TYPES[entry.screenshot.type];
+        let bytes;
+        try {
+          bytes = await readFile(path.join(proofDir, `${entry.id}.${ext}`));
+        } catch {
+          throw new HttpError(404, 'That screenshot is not in the book.');
+        }
+        res.writeHead(200, {
+          'Content-Type': entry.screenshot.type,
+          'Content-Length': bytes.length,
+          'Content-Disposition': `inline; filename="proof-${entry.id}.${ext}"`,
+          'Cache-Control': 'private, no-store',
+          'Content-Security-Policy': "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox",
+          'X-Content-Type-Options': 'nosniff',
+          'Referrer-Policy': 'no-referrer',
+          'X-Frame-Options': 'SAMEORIGIN',
+        });
+        res.end(bytes);
+        return;
+      }
       if (simulate && req.method === 'POST') {
         const session = requireSub(data(), token, now);
         const invoiceId = simulate[1];
@@ -1159,7 +1230,7 @@ export function createServer(options = {}) {
       const payload = await handler();
       send(res, 200, payload);
     } catch (error) {
-      const status = error instanceof HttpError || error instanceof GameError ? error.status : 500;
+      const status = error instanceof HttpError || error instanceof GameError || error instanceof ProofError ? error.status : 500;
       if (status === 500) console.error('bijouxdebt', error instanceof Error ? error.message : 'error');
       send(res, status, { error: status === 500 ? 'The book could not do that.' : error.message });
     }
