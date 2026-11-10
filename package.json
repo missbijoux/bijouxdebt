@@ -1,0 +1,17 @@
+{
+  "name": "ohmtracker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Ohm Tracker — club credit ledger and tip rail for professional club owners.",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test ledger.test.mjs ohm.test.mjs server.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}
