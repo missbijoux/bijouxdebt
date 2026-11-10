@@ -517,7 +517,7 @@ export function createServer(options = {}) {
             kind: 'debt_signed',
             title: `${sub.handle} signed the debt`,
             body: `${money(sub.debt.principalCents)} is active now.`,
-            href: '/studio',
+            href: `/studio/names/${sub.id}`,
           }, now, notices);
           return { sub: privateSub(sub, now) };
         });
@@ -563,7 +563,7 @@ export function createServer(options = {}) {
             kind: 'claim_pending',
             title: `${sub.handle} claimed a payment`,
             body: `${money(amount)} toward ${purpose} is waiting for you.`,
-            href: '/studio',
+            href: `/studio/names/${sub.id}`,
           }, now, notices);
           return { sub: privateSub(sub, now) };
         });
@@ -616,7 +616,7 @@ export function createServer(options = {}) {
             kind: 'game_accepted',
             title: `${sub.handle} accepted ${GAMES[key]} terms`,
             body: `Version ${game.version} is ready to play.`,
-            href: `/studio/games/${sub.id}`,
+            href: `/studio/names/${sub.id}`,
           }, now, notices);
           return { sub: privateSub(sub, now) };
         });
@@ -764,7 +764,7 @@ export function createServer(options = {}) {
             kind: 'task_done',
             title: `${sub.handle} marked a task done`,
             body: task.title,
-            href: '/studio',
+            href: `/studio/names/${sub.id}`,
           }, now, notices);
           return { sub: privateSub(sub, now) };
         });

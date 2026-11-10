@@ -52,6 +52,10 @@ Open `http://127.0.0.1:8787`. The studio pin is read from the environment and is
 
 The book is stored in `data/book.json`.
 
+## Studio roster
+
+The studio home is a roster of every name in the book: search, sort, and a “Needs you” list for claims, tasks, and waiting signatures. Open a name for debts, charges, payments, tasks, and the feed, or jump to that name’s games.
+
 ## Alerts
 
 High-signal changes write an unread notice into the book: debt proposed or signed, game terms changed or accepted, claims, tasks, charges, and debt status. While someone is signed in, the page polls for unread notices, shows a toast, and keeps a badge until they are marked read.
