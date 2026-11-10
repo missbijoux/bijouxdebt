@@ -53,6 +53,10 @@ const state = {
   replayQueue: [],
   atm: {},
   preview: {},
+  notices: [],
+  unread: 0,
+  toasted: new Set(),
+  push: { supported: false, permission: 'default', subscribed: false, busy: false },
 };
 
 try {
@@ -257,6 +261,10 @@ function banner() {
 }
 
 function shell(current, ...main) {
+  const withUnread = (label, show) => {
+    if (!show || !state.unread) return label;
+    return el('span', { class: 'nav-label' }, label, el('span', { class: 'badge', 'aria-label': `${state.unread} unread` }, String(state.unread)));
+  };
   const link = (href, label) => el('a', { href: `#${href}`, 'aria-current': current === href ? 'page' : null }, label);
   const app = document.getElementById('app');
   app.replaceChildren(el('header', { class: 'top' },
@@ -264,12 +272,62 @@ function shell(current, ...main) {
     el('nav', null,
       link('/', 'The book'),
       link('/join', 'Open a name'),
-      link('/book', state.sub ? state.sub.handle : 'My book'),
+      link('/book', withUnread(state.sub ? state.sub.handle : 'My book', state.role === 'sub')),
       link('/games', 'Games'),
-      link('/studio', 'Studio'),
+      link('/studio', withUnread('Studio', state.role === 'studio')),
       el('a', { class: 'site-link', href: 'https://mistressbijoux.com', rel: 'noopener noreferrer' }, 'mistressbijoux.com'),
     ),
   ), el('main', { class: 'wrap' }, ...main));
+}
+
+function alertsPanel() {
+  const role = state.role;
+  if (role !== 'sub' && role !== 'studio') return null;
+  return el('section', { class: 'panel alerts' },
+    el('h2', null, 'Alerts'),
+    el('p', { class: 'muted' }, role === 'studio'
+      ? 'Toasts and browser push when someone signs, claims, or accepts terms. Email can come later for the same high-signal events.'
+      : 'Toasts and browser push when she proposes a debt, changes game terms, or decides a claim. Email can come later if you opt in.'),
+    state.notices.length
+      ? el('ul', { class: 'alert-list' }, ...state.notices.slice(0, 8).map((notice) => el('li', null,
+        el('button', {
+          class: 'alert-item',
+          type: 'button',
+          onclick: () => openNotice(notice),
+        }, el('strong', null, notice.title), el('span', { class: 'muted' }, notice.body)),
+      )))
+      : el('p', { class: 'muted' }, 'Nothing waiting right now.'),
+    state.notices.length
+      ? el('button', { class: 'btn secondary small-btn', type: 'button', onclick: clearNotices }, 'Mark all read')
+      : null,
+    pushControls(),
+  );
+}
+
+function pushControls() {
+  if (!state.push.supported) {
+    return el('p', { class: 'muted' }, 'This browser does not support push notifications.');
+  }
+  if (state.push.permission === 'denied') {
+    return el('p', { class: 'muted' }, 'Browser notifications are blocked for this site. You can still use the in-page toasts.');
+  }
+  if (state.push.subscribed) {
+    return el('div', { class: 'row' },
+      el('p', { class: 'muted' }, 'Browser push is on for this device.'),
+      el('button', {
+        class: 'btn secondary small-btn',
+        type: 'button',
+        disabled: state.push.busy ? true : null,
+        onclick: disablePush,
+      }, 'Turn push off'),
+    );
+  }
+  return el('button', {
+    class: 'btn secondary',
+    type: 'button',
+    disabled: state.push.busy ? true : null,
+    onclick: enablePush,
+  }, 'Enable browser push');
 }
 
 function home() {
@@ -388,6 +446,8 @@ async function createName(event) {
   state.sub = session.sub;
   state.notice = 'Your name is in the book.';
   location.hash = '#/book';
+  await refreshPushState();
+  watchNotices(true);
   await consumePending();
 }
 
@@ -401,6 +461,8 @@ async function enterName(event) {
   state.sub = session.sub;
   state.notice = 'The book is open.';
   location.hash = '#/book';
+  await refreshPushState();
+  watchNotices(true);
   await consumePending();
 }
 
@@ -439,6 +501,7 @@ function book() {
       figure('Waiting', money(sub.askCents), `ATM holds ${money(sub.atm.balanceCents)}`),
     ),
     debtPanel(debt),
+    alertsPanel(),
     invoicePanel(),
     el('div', { class: 'grid split' },
       el('section', { class: 'panel' },
@@ -594,6 +657,7 @@ function studio() {
       figure('This month', money(book.sentThisMonthCents), 'Confirmed payments'),
       figure('Names', String(book.subs.length), book.checkout === 'live' ? 'Lightning is live' : 'Lightning is in sample mode'),
     ),
+    alertsPanel(),
     tierEditor(book),
     ...book.subs.map(studioCard),
     book.subs.length ? null : el('p', { class: 'muted' }, 'No names yet. They open one from the public page.'),
@@ -844,6 +908,11 @@ async function logout() {
   state.sub = null;
   state.studio = null;
   state.invoice = null;
+  state.notices = [];
+  state.unread = 0;
+  state.toasted = new Set();
+  state.noticeWatch = false;
+  state.push.subscribed = false;
   state.notice = 'Closed.';
   location.hash = '#/';
   render();
@@ -856,6 +925,8 @@ async function studioLogin(event) {
   state.sub = null;
   state.studio = await api('/api/studio');
   state.notice = 'Studio is open.';
+  await refreshPushState();
+  watchNotices(true);
   render();
 }
 
@@ -1861,6 +1932,149 @@ function render() {
   else home();
 }
 
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  return Uint8Array.from(raw, (char) => char.charCodeAt(0));
+}
+
+function paintToasts() {
+  const host = document.getElementById('toasts');
+  if (!host) return;
+  const active = [...host.querySelectorAll('[data-notice-id]')].map((node) => node.getAttribute('data-notice-id'));
+  let shown = 0;
+  for (const notice of state.notices) {
+    if (state.toasted.has(notice.id) || active.includes(notice.id)) continue;
+    state.toasted.add(notice.id);
+    if (shown >= 3) continue;
+    shown += 1;
+    const toast = el('button', {
+      class: 'toast',
+      type: 'button',
+      'data-notice-id': notice.id,
+      onclick: () => openNotice(notice),
+    }, el('strong', null, notice.title), el('span', null, notice.body));
+    host.prepend(toast);
+    setTimeout(() => toast.remove(), 8000);
+  }
+}
+
+async function pullNotices() {
+  if (state.role !== 'sub' && state.role !== 'studio') {
+    state.notices = [];
+    state.unread = 0;
+    return;
+  }
+  try {
+    const data = await api('/api/notices');
+    const next = data.notices || [];
+    const unread = data.unread ?? next.length;
+    const changed = unread !== state.unread || next.length !== state.notices.length
+      || next.some((notice, index) => notice.id !== state.notices[index]?.id);
+    state.notices = next;
+    state.unread = unread;
+    paintToasts();
+    if (changed && canRefresh()) render();
+  } catch { /* try again on the next tick */ }
+}
+
+function watchNotices(immediate = false) {
+  if (state.noticeWatch) return;
+  state.noticeWatch = true;
+  const tick = async () => {
+    if (state.role !== 'sub' && state.role !== 'studio') {
+      state.noticeWatch = false;
+      return;
+    }
+    await pullNotices();
+    setTimeout(tick, 4000);
+  };
+  if (immediate) pullNotices().then(() => setTimeout(tick, 4000));
+  else setTimeout(tick, 4000);
+}
+
+async function openNotice(notice) {
+  try {
+    await api('/api/notices/read', { method: 'POST', body: { ids: [notice.id] } });
+  } catch { /* still navigate */ }
+  document.querySelector(`[data-notice-id="${notice.id}"]`)?.remove();
+  state.notices = state.notices.filter((item) => item.id !== notice.id);
+  state.unread = state.notices.length;
+  if (notice.href) location.hash = `#${notice.href}`;
+  else render();
+}
+
+async function clearNotices() {
+  await api('/api/notices/read', { method: 'POST', body: { all: true } });
+  state.notices = [];
+  state.unread = 0;
+  document.getElementById('toasts')?.replaceChildren();
+  render();
+}
+
+async function refreshPushState() {
+  const supported = Boolean(window.PushManager && navigator.serviceWorker);
+  state.push.supported = supported;
+  state.push.permission = supported && Notification?.permission ? Notification.permission : 'denied';
+  state.push.subscribed = false;
+  if (!supported || (state.role !== 'sub' && state.role !== 'studio')) return;
+  try {
+    const registration = await navigator.serviceWorker.getRegistration(BASE || '/');
+    const subscription = await registration?.pushManager?.getSubscription();
+    state.push.subscribed = Boolean(subscription);
+  } catch {
+    state.push.subscribed = false;
+  }
+}
+
+async function enablePush() {
+  if (state.push.busy) return;
+  state.push.busy = true;
+  render();
+  try {
+    const registration = await navigator.serviceWorker.register(`${BASE}/sw.js`, { scope: `${BASE}/` || '/' });
+    await navigator.serviceWorker.ready;
+    const permission = await Notification.requestPermission();
+    state.push.permission = permission;
+    if (permission !== 'granted') throw new Error('Browser notifications were not allowed.');
+    const { publicKey } = await api('/api/push/key');
+    const subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey),
+    });
+    await api('/api/push/subscribe', { method: 'POST', body: { subscription: subscription.toJSON() } });
+    state.push.subscribed = true;
+    state.notice = 'Browser push is on for this device.';
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.push.busy = false;
+    render();
+  }
+}
+
+async function disablePush() {
+  if (state.push.busy) return;
+  state.push.busy = true;
+  render();
+  try {
+    const registration = await navigator.serviceWorker.getRegistration(BASE || '/');
+    const subscription = await registration?.pushManager?.getSubscription();
+    if (subscription) {
+      await api('/api/push/unsubscribe', { method: 'POST', body: { endpoint: subscription.endpoint } });
+      await subscription.unsubscribe();
+    }
+    state.push.subscribed = false;
+    state.notice = 'Browser push is off on this device.';
+  } catch (error) {
+    state.error = error.message;
+  } finally {
+    state.push.busy = false;
+    render();
+  }
+}
+
 async function boot() {
   try {
     const [pub, session] = await Promise.all([api('/api/public'), api('/api/session')]);
@@ -1868,11 +2082,21 @@ async function boot() {
     state.role = session.role;
     state.sub = session.sub || null;
     if (session.role === 'studio') state.studio = await api('/api/studio');
+    if (session.role === 'sub' || session.role === 'studio') {
+      await refreshPushState();
+      watchNotices(true);
+    }
   } catch (error) {
     state.error = error.message;
   }
   render();
 }
+
+navigator.serviceWorker?.addEventListener('message', (event) => {
+  if (event.data?.type !== 'bijouxdebt-open') return;
+  if (event.data.href) location.hash = `#${event.data.href}`;
+  pullNotices(false);
+});
 
 window.addEventListener('hashchange', () => {
   state.formError = null;

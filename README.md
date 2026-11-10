@@ -47,8 +47,18 @@ Open `http://127.0.0.1:8787`. The studio pin is read from the environment and is
 | `LND_TLS_CERT_BASE64` | Node certificate. Prefer this. |
 | `LND_TLS_INSECURE` | Set to `true` only if you intentionally skip certificate checks. |
 | `LND_INVOICE_INCLUDE_ROUTE_HINTS` | Set to `false` to omit routing hints. Default includes them, matching Pantheon. |
+| `BIJOUX_VAPID_PUBLIC_KEY` / `BIJOUX_VAPID_PRIVATE_KEY` | Optional. Pin Web Push VAPID keys. If unset, the book generates and stores a pair on first use. |
+| `BIJOUX_VAPID_SUBJECT` | Optional `mailto:` or `https:` contact for VAPID. Defaults to `mailto:studio@mistressbijoux.com`. |
 
 The book is stored in `data/book.json`.
+
+## Alerts
+
+High-signal changes write an unread notice into the book: debt proposed or signed, game terms changed or accepted, claims, tasks, charges, and debt status. While someone is signed in, the page polls for unread notices, shows a toast, and keeps a badge until they are marked read.
+
+Browser push is optional per device. On your book or in the studio, use **Enable browser push**. That asks the browser for permission and stores a push subscription in the book. No email is required. Push needs HTTPS (or localhost).
+
+Email is reserved for the same high-signal events later. It will need a provider key and an opt-in contact on the name; nothing is sent today.
 
 ## WordPress
 

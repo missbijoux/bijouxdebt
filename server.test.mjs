@@ -653,6 +653,75 @@ test('games stay locked until real money arrives, and for holds, missed minimums
   }
 });
 
+test('unread notices and push keys stay per role', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'bijouxdebt-notices-'));
+  const server = createServer({
+    dataFile: path.join(dir, 'book.json'),
+    pin: 'studio-pin-test',
+    now: () => new Date('2026-02-01T17:00:00.000Z'),
+    ohm: { mode: () => 'sandbox', async createInvoice() {}, async checkInvoice() {} },
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  await server.ready;
+  const port = server.address().port;
+  const alice = jar();
+  const studio = jar();
+  try {
+    const joined = await alice.call(port, 'POST', '/api/join', {
+      handle: 'alice',
+      passphrase: 'alice-pass',
+      title: 'devotee',
+      adult: true,
+    });
+    assert.equal(joined.status, 200);
+    await studio.call(port, 'POST', '/api/studio/login', { pin: 'studio-pin-test' });
+    await studio.call(port, 'POST', '/api/studio/debt', {
+      subId: joined.json.sub.id,
+      principalCents: 10_000,
+      apr: 0,
+      dueDay: 15,
+    });
+
+    const aliceNotices = await alice.call(port, 'GET', '/api/notices');
+    assert.equal(aliceNotices.status, 200);
+    assert.equal(aliceNotices.json.unread, 1);
+    assert.equal(aliceNotices.json.notices[0].kind, 'debt_proposed');
+
+    const studioBefore = await studio.call(port, 'GET', '/api/notices');
+    assert.equal(studioBefore.json.unread, 0);
+
+    await alice.call(port, 'POST', '/api/me/sign');
+    const studioAfter = await studio.call(port, 'GET', '/api/notices');
+    assert.equal(studioAfter.json.unread, 1);
+    assert.equal(studioAfter.json.notices[0].kind, 'debt_signed');
+
+    const key = await alice.call(port, 'GET', '/api/push/key');
+    assert.equal(key.status, 200);
+    assert.match(key.json.publicKey, /^B/);
+
+    const subscribed = await alice.call(port, 'POST', '/api/push/subscribe', {
+      subscription: {
+        endpoint: 'https://push.example/alice',
+        keys: { p256dh: 'dGVzdC1wMjU2ZGg', auth: 'dGVzdC1hdXRo' },
+      },
+    });
+    assert.equal(subscribed.status, 200);
+
+    await alice.call(port, 'POST', '/api/notices/read', { all: true });
+    const cleared = await alice.call(port, 'GET', '/api/notices');
+    assert.equal(cleared.json.unread, 0);
+
+    const sw = await fetch(`http://127.0.0.1:${port}/sw.js`);
+    assert.equal(sw.status, 200);
+    assert.match(await sw.text(), /showNotification/);
+  } finally {
+    server.closeAllConnections?.();
+    server.close();
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 function jar() {
   let cookie = '';
   return {

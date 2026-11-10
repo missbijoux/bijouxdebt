@@ -33,6 +33,17 @@ import {
   upgradeSub,
 } from './games.mjs';
 import { accrue, applyConfirmedPayment, LIMITS, money, nextDueLabel, nyDate } from './ledger.mjs';
+import {
+  addNotice,
+  deliverNotice,
+  ensureVapid,
+  markNoticesRead,
+  publicNotice,
+  removePushSubscription,
+  savePushSubscription,
+  unreadNotices,
+  vapidKeys,
+} from './notify.mjs';
 import { createOhm } from './ohm.mjs';
 import { cleanScreenshot, PROOF_TYPES, ProofError, referenceOf } from './proof.mjs';
 import { createStore, hashSecret, newId, TITLES, verifySecret } from './store.mjs';
@@ -189,6 +200,32 @@ function pushEntry(sub, entry) {
   }
   sub.entries.push(entry);
   return entry;
+}
+
+function note(book, partial, now, bag) {
+  const notice = addNotice(book, partial, now);
+  bag.push(notice);
+  return notice;
+}
+
+function releaseNotices(store, notices) {
+  for (const notice of notices) {
+    (async () => {
+      try {
+        const result = await deliverNotice(store.snapshot(), notice);
+        if (result.push?.pruned) await store.update(() => {});
+      } catch (error) {
+        console.error('bijouxdebt notify', error instanceof Error ? error.message : 'error');
+      }
+    })();
+  }
+}
+
+async function mutate(store, work) {
+  const notices = [];
+  const result = await store.update((book) => work(book, notices));
+  releaseNotices(store, notices);
+  return result;
 }
 
 function accrueSub(sub, now) {
@@ -458,7 +495,7 @@ export function createServer(options = {}) {
       },
       'POST /api/me/sign': async () => {
         const session = requireSub(data(), token, now);
-        return store.update((book) => {
+        return mutate(store, (book, notices) => {
           const sub = findSub(book, session.subId);
           if (sub.debt?.status !== 'proposed') throw new HttpError(400, 'There is no debt waiting for your signature.');
           sub.debt.status = 'active';
@@ -473,6 +510,15 @@ export function createServer(options = {}) {
             source: 'sub',
             note: 'Debt signed',
           }, now));
+          note(book, {
+            audience: 'studio',
+            subId: sub.id,
+            handle: sub.handle,
+            kind: 'debt_signed',
+            title: `${sub.handle} signed the debt`,
+            body: `${money(sub.debt.principalCents)} is active now.`,
+            href: '/studio',
+          }, now, notices);
           return { sub: privateSub(sub, now) };
         });
       },
@@ -488,7 +534,7 @@ export function createServer(options = {}) {
         if (!reference && !screenshot) {
           throw new HttpError(400, 'Add the transaction ID, a screenshot of the payment, or both.');
         }
-        return store.update(async (book) => {
+        return mutate(store, async (book, notices) => {
           const sub = findSub(book, session.subId);
           if (purpose === 'debt' && sub.debt?.status !== 'active') {
             throw new HttpError(400, 'A debt payment can be claimed only after you sign a debt.');
@@ -510,6 +556,15 @@ export function createServer(options = {}) {
             await mkdir(proofDir, { recursive: true });
             await writeFile(path.join(proofDir, `${entry.id}.${PROOF_TYPES[screenshot.type]}`), screenshot.bytes);
           }
+          note(book, {
+            audience: 'studio',
+            subId: sub.id,
+            handle: sub.handle,
+            kind: 'claim_pending',
+            title: `${sub.handle} claimed a payment`,
+            body: `${money(amount)} toward ${purpose} is waiting for you.`,
+            href: '/studio',
+          }, now, notices);
           return { sub: privateSub(sub, now) };
         });
       },
@@ -542,7 +597,7 @@ export function createServer(options = {}) {
         const session = requireSub(data(), token, now);
         const body = await readBody(req);
         const key = gameKeyOf(body.game);
-        return store.update((book) => {
+        return mutate(store, (book, notices) => {
           const sub = findSub(book, session.subId);
           const game = sub.games[key];
           if (!game) throw new HttpError(404, `She has not set up the ${GAMES[key].toLowerCase()} for you.`);
@@ -554,6 +609,15 @@ export function createServer(options = {}) {
             source: 'sub',
             note: `${GAMES[key]} terms accepted (version ${game.version})`,
           }, now));
+          note(book, {
+            audience: 'studio',
+            subId: sub.id,
+            handle: sub.handle,
+            kind: 'game_accepted',
+            title: `${sub.handle} accepted ${GAMES[key]} terms`,
+            body: `Version ${game.version} is ready to play.`,
+            href: `/studio/games/${sub.id}`,
+          }, now, notices);
           return { sub: privateSub(sub, now) };
         });
       },
@@ -687,12 +751,21 @@ export function createServer(options = {}) {
       'POST /api/me/task-done': async () => {
         const session = requireSub(data(), token, now);
         const body = await readBody(req);
-        return store.update((book) => {
+        return mutate(store, (book, notices) => {
           const sub = findSub(book, session.subId);
           const task = sub.tasks.find((item) => item.id === body.taskId);
           if (!task || task.status !== 'open') throw new HttpError(404, 'That task is not open.');
           task.status = 'done_pending';
           task.markedAt = now.toISOString();
+          note(book, {
+            audience: 'studio',
+            subId: sub.id,
+            handle: sub.handle,
+            kind: 'task_done',
+            title: `${sub.handle} marked a task done`,
+            body: task.title,
+            href: '/studio',
+          }, now, notices);
           return { sub: privateSub(sub, now) };
         });
       },
@@ -796,7 +869,7 @@ export function createServer(options = {}) {
         if (!Number.isInteger(dueDay) || dueDay < 1 || dueDay > 28) {
           throw new HttpError(400, 'The due day must be from the 1st through the 28th.');
         }
-        return store.update((book) => {
+        return mutate(store, (book, notices) => {
           const sub = findSub(book, body.subId);
           if (sub.debt && (sub.debt.status === 'active' || sub.debt.status === 'paused')) {
             throw new HttpError(400, 'Settle the open debt before writing another.');
@@ -820,14 +893,32 @@ export function createServer(options = {}) {
             source: 'domme',
             note: 'Debt proposed. It stays frozen until it is signed.',
           }, now));
+          note(book, {
+            audience: 'sub',
+            subId: sub.id,
+            handle: sub.handle,
+            kind: 'debt_proposed',
+            title: 'A debt is waiting for your signature',
+            body: `${money(principalCents)} proposed. It stays frozen until you sign.`,
+            href: '/book',
+          }, now, notices);
           return { sub: privateSub(sub, now) };
         });
       },
-      'POST /api/studio/charge': async () => studioAmount(data, token, now, req, (sub, amount, text) => {
+      'POST /api/studio/charge': async () => studioAmount(data, token, now, req, store, (sub, amount, text, book, notices) => {
         accrueSub(sub, now);
         if (sub.debt?.status !== 'active') throw new HttpError(400, 'Charges land on a signed debt.');
         sub.debt.balanceCents += amount;
         pushEntry(sub, stampEntry({ kind: 'charge', amountCents: amount, purpose: 'debt', source: 'domme', note: text || 'Charge' }, now));
+        note(book, {
+          audience: 'sub',
+          subId: sub.id,
+          handle: sub.handle,
+          kind: 'charge',
+          title: 'A charge was added',
+          body: `${money(amount)}${text ? ` · ${text}` : ''}`,
+          href: '/book',
+        }, now, notices);
       }),
       'POST /api/studio/payment': async () => {
         requireStudio(data(), token, now);
@@ -859,7 +950,7 @@ export function createServer(options = {}) {
         if (body.decision !== 'confirm' && body.decision !== 'reject') {
           throw new HttpError(400, 'Confirm or reject the claim.');
         }
-        return store.update((book) => {
+        return mutate(store, (book, notices) => {
           const sub = book.subs.find((item) => item.entries.some((entry) => entry.id === body.entryId));
           if (!sub) throw new HttpError(404, 'That claim is not in the book.');
           const entry = sub.entries.find((item) => item.id === body.entryId);
@@ -867,10 +958,28 @@ export function createServer(options = {}) {
           accrueSub(sub, now);
           if (body.decision === 'reject') {
             entry.status = 'rejected';
+            note(book, {
+              audience: 'sub',
+              subId: sub.id,
+              handle: sub.handle,
+              kind: 'claim_decided',
+              title: 'Your claim was rejected',
+              body: `${money(entry.amountCents)} toward ${entry.purpose} was turned down.`,
+              href: '/book',
+            }, now, notices);
             return { sub: privateSub(sub, now) };
           }
           const applied = applyConfirmedPayment(sub, entry.amountCents, entry.purpose);
           Object.assign(entry, applied, { status: 'confirmed', kind: applied.purpose === 'debt' ? 'payment' : 'tribute' });
+          note(book, {
+            audience: 'sub',
+            subId: sub.id,
+            handle: sub.handle,
+            kind: 'claim_decided',
+            title: 'Your claim was confirmed',
+            body: `${money(entry.amountCents)} toward ${entry.purpose} is in the book.`,
+            href: '/book',
+          }, now, notices);
           return { sub: privateSub(sub, now) };
         });
       },
@@ -883,7 +992,7 @@ export function createServer(options = {}) {
         if (detail.length > 280) throw new HttpError(400, 'Keep the task detail shorter.');
         if (body.due && !/^\d{4}-\d{2}-\d{2}$/.test(body.due)) throw new HttpError(400, 'Use a due date like 2026-11-30.');
         const penaltyCents = cents(body.penaltyCents ?? 0, 0, LIMITS.maxPenaltyCents, 'The penalty');
-        return store.update((book) => {
+        return mutate(store, (book, notices) => {
           const sub = findSub(book, body.subId);
           if (sub.tasks.length >= LIMITS.maxTasks) throw new HttpError(400, 'Clear old tasks first.');
           sub.tasks.push({
@@ -895,6 +1004,15 @@ export function createServer(options = {}) {
             status: 'open',
             createdAt: now.toISOString(),
           });
+          note(book, {
+            audience: 'sub',
+            subId: sub.id,
+            handle: sub.handle,
+            kind: 'task_assigned',
+            title: 'A new task is waiting',
+            body: title,
+            href: '/book',
+          }, now, notices);
           return { sub: privateSub(sub, now) };
         });
       },
@@ -904,7 +1022,7 @@ export function createServer(options = {}) {
         if (body.decision !== 'accept' && body.decision !== 'miss') {
           throw new HttpError(400, 'Accept the task or mark it missed.');
         }
-        return store.update((book) => {
+        return mutate(store, (book, notices) => {
           const sub = findSub(book, body.subId);
           const task = sub.tasks.find((item) => item.id === body.taskId);
           if (!task || (task.status !== 'open' && task.status !== 'done_pending')) {
@@ -934,6 +1052,17 @@ export function createServer(options = {}) {
               }, now));
             }
           }
+          note(book, {
+            audience: 'sub',
+            subId: sub.id,
+            handle: sub.handle,
+            kind: 'task_verdict',
+            title: body.decision === 'accept' ? 'She accepted your task' : 'She marked a task missed',
+            body: task.title + (body.decision === 'miss' && task.penaltyCents
+              ? ` · penalty ${money(task.penaltyCents)}`
+              : ''),
+            href: '/book',
+          }, now, notices);
           return { sub: privateSub(sub, now) };
         });
       },
@@ -942,7 +1071,7 @@ export function createServer(options = {}) {
         const body = await readBody(req);
         const key = gameKeyOf(body.game);
         const terms = normalizeTerms(key, body.terms);
-        return store.update((book) => {
+        return mutate(store, (book, notices) => {
           const sub = findSub(book, body.subId);
           if (sub.games[key]) reviseGame(sub.games[key], terms, now);
           else sub.games[key] = newGame(terms, now);
@@ -952,6 +1081,15 @@ export function createServer(options = {}) {
             source: 'domme',
             note: `${GAMES[key]} terms proposed (version ${sub.games[key].version}). Nothing can be played until they are accepted.`,
           }, now));
+          note(book, {
+            audience: 'sub',
+            subId: sub.id,
+            handle: sub.handle,
+            kind: 'game_terms',
+            title: `${GAMES[key]} terms need your acceptance`,
+            body: `Version ${sub.games[key].version}. Nothing can be played until you accept.`,
+            href: '/games',
+          }, now, notices);
           return { sub: privateSub(sub, now) };
         });
       },
@@ -1093,31 +1231,88 @@ export function createServer(options = {}) {
       'POST /api/studio/status': async () => {
         requireStudio(data(), token, now);
         const body = await readBody(req);
-        return store.update((book) => {
+        return mutate(store, (book, notices) => {
           const sub = findSub(book, body.subId);
           const debt = sub.debt;
           if (!debt) throw new HttpError(400, 'There is no debt on this name.');
+          let label = '';
           if (body.action === 'pause' && debt.status === 'active') {
             accrueSub(sub, now);
             debt.status = 'paused';
+            label = 'She paused your debt. Interest is frozen.';
           } else if (body.action === 'resume' && debt.status === 'paused') {
             debt.status = 'active';
             debt.accruedThrough = nyDate(now);
+            label = 'She resumed your debt. The clock is running again.';
           } else if (body.action === 'settle' && (debt.status === 'active' || debt.status === 'paused')) {
             if (debt.status === 'active') accrueSub(sub, now);
             debt.status = 'settled';
             pushEntry(sub, stampEntry({ kind: 'settled', amountCents: debt.balanceCents, purpose: 'debt', source: 'domme', note: 'Debt settled. The clock has stopped.' }, now));
+            label = 'She settled your debt. The clock has stopped.';
           } else if (body.action === 'forgive' && (debt.status === 'active' || debt.status === 'paused')) {
             if (debt.status === 'active') accrueSub(sub, now);
             const forgiven = debt.balanceCents;
             debt.balanceCents = 0;
             debt.status = 'settled';
             pushEntry(sub, stampEntry({ kind: 'forgive', amountCents: forgiven, purpose: 'debt', source: 'domme', note: 'Balance forgiven. The clock has stopped.' }, now));
+            label = 'She forgave the balance. The clock has stopped.';
           } else {
             throw new HttpError(400, 'That cannot be done to this debt.');
           }
+          note(book, {
+            audience: 'sub',
+            subId: sub.id,
+            handle: sub.handle,
+            kind: 'debt_status',
+            title: 'Your debt was updated',
+            body: label,
+            href: '/book',
+          }, now, notices);
           return { sub: privateSub(sub, now) };
         });
+      },
+      'GET /api/notices': async () => {
+        const session = requireActor(data(), token, now);
+        const unread = unreadNotices(data(), session).map(publicNotice);
+        return { notices: unread, unread: unread.length, push: Boolean(vapidKeys(data())) };
+      },
+      'POST /api/notices/read': async () => {
+        const session = requireActor(data(), token, now);
+        const body = await readBody(req);
+        const ids = body.all === true ? null : body.ids;
+        if (ids != null && !Array.isArray(ids)) throw new HttpError(400, 'Send notice ids, or all: true.');
+        await store.update((book) => {
+          markNoticesRead(book, session, ids, now);
+        });
+        return { ok: true, unread: unreadNotices(data(), session).length };
+      },
+      'GET /api/push/key': async () => {
+        requireActor(data(), token, now);
+        const keys = await store.update((book) => ensureVapid(book));
+        return { publicKey: keys.publicKey };
+      },
+      'POST /api/push/subscribe': async () => {
+        const session = requireActor(data(), token, now);
+        const body = await readBody(req);
+        try {
+          await store.update((book) => {
+            ensureVapid(book);
+            savePushSubscription(book, session, body.subscription || body, now);
+          });
+        } catch (error) {
+          throw new HttpError(400, error instanceof Error ? error.message : 'That push subscription looks wrong.');
+        }
+        return { ok: true };
+      },
+      'POST /api/push/unsubscribe': async () => {
+        const session = requireActor(data(), token, now);
+        const body = await readBody(req);
+        const endpoint = String(body.endpoint || body.subscription?.endpoint || '');
+        if (!endpoint) throw new HttpError(400, 'Say which push subscription to remove.');
+        await store.update((book) => {
+          removePushSubscription(book, session, endpoint);
+        });
+        return { ok: true };
       },
       'POST /api/studio/tiers': async () => {
         requireStudio(data(), token, now);
@@ -1236,14 +1431,14 @@ export function createServer(options = {}) {
     }
   }
 
-  async function studioAmount(bookData, token, now, req, apply) {
+  async function studioAmount(bookData, token, now, req, storeRef, apply) {
     requireStudio(bookData(), token, now);
     const body = await readBody(req);
     const amount = cents(body.amountCents, LIMITS.minCheckoutCents, LIMITS.maxCheckoutCents, 'An amount');
     const text = noteOf(body.note);
-    return store.update((book) => {
+    return mutate(storeRef, (book, notices) => {
       const sub = findSub(book, body.subId);
-      apply(sub, amount, text);
+      apply(sub, amount, text, book, notices);
       return { sub: privateSub(sub, now) };
     });
   }
@@ -1267,6 +1462,14 @@ function requireSub(data, token, now) {
 function requireStudio(data, token, now) {
   const session = sessionFrom(data, token, now);
   if (!session || session.role !== 'studio') throw new HttpError(401, 'The studio is locked.');
+  return session;
+}
+
+function requireActor(data, token, now) {
+  const session = sessionFrom(data, token, now);
+  if (!session || (session.role !== 'sub' && session.role !== 'studio')) {
+    throw new HttpError(401, 'Sign in first.');
+  }
   return session;
 }
 
@@ -1343,7 +1546,7 @@ async function serveStatic(pathname, res, base) {
         'Content-Type': 'text/html; charset=utf-8',
         'Content-Length': body.length,
         'Cache-Control': 'no-store',
-        'Content-Security-Policy': "default-src 'self'; style-src 'self'; img-src 'self' data:; script-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'",
+        'Content-Security-Policy': "default-src 'self'; style-src 'self'; img-src 'self' data:; script-src 'self'; worker-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'self'",
         'X-Content-Type-Options': 'nosniff',
         'Referrer-Policy': 'no-referrer',
         'X-Frame-Options': 'SAMEORIGIN',

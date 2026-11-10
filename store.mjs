@@ -21,6 +21,8 @@ export function emptyBook() {
     subs: [],
     sessions: [],
     invoices: [],
+    notices: [],
+    pushSubscriptions: [],
   };
 }
 
@@ -57,6 +59,8 @@ export function createStore(file) {
     if (!Array.isArray(data.subs)) data.subs = [];
     if (!Array.isArray(data.sessions)) data.sessions = [];
     if (!Array.isArray(data.invoices)) data.invoices = [];
+    if (!Array.isArray(data.notices)) data.notices = [];
+    if (!Array.isArray(data.pushSubscriptions)) data.pushSubscriptions = [];
     for (const sub of data.subs) upgradeSub(sub);
   }
 
