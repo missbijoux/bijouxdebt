@@ -57,6 +57,8 @@ const state = {
   unread: 0,
   toasted: new Set(),
   push: { supported: false, permission: 'default', subscribed: false, busy: false },
+  studioQuery: '',
+  studioSort: 'attention',
 };
 
 try {
@@ -643,12 +645,18 @@ function studio() {
     );
     return;
   }
+  const nameFor = route().match(/^\/studio\/names\/([a-f0-9]+)$/);
+  if (nameFor) {
+    studioName(nameFor[1]);
+    return;
+  }
   const gamesFor = route().match(/^\/studio\/games\/([a-f0-9]+)$/);
   if (gamesFor) {
     studioGames(gamesFor[1]);
     return;
   }
   const book = state.studio;
+  const waiting = book.subs.filter((sub) => studioAttention(sub).length);
   shell('/studio',
     ...banner(),
     el('p', { class: 'kicker' }, book.month),
@@ -656,12 +664,228 @@ function studio() {
     el('div', { class: 'grid cards' },
       figure('This month', money(book.sentThisMonthCents), 'Confirmed payments'),
       figure('Names', String(book.subs.length), book.checkout === 'live' ? 'Lightning is live' : 'Lightning is in sample mode'),
+      figure('Needs you', String(waiting.length), waiting.length ? 'Claims, tasks, or signatures waiting' : 'Nothing waiting'),
     ),
     alertsPanel(),
+    waiting.length ? studioAttentionList(waiting) : null,
+    studioRoster(book),
     tierEditor(book),
-    ...book.subs.map(studioCard),
-    book.subs.length ? null : el('p', { class: 'muted' }, 'No names yet. They open one from the public page.'),
     el('button', { class: 'btn secondary', type: 'button', onclick: logout }, 'Lock the studio'),
+  );
+}
+
+function studioAttention(sub) {
+  const flags = [];
+  const pendingClaims = (sub.entries || []).filter((entry) => entry.status === 'pending').length;
+  if (pendingClaims) flags.push(pendingClaims === 1 ? '1 claim' : `${pendingClaims} claims`);
+  const openTasks = (sub.tasks || []).filter((task) => task.status === 'open' || task.status === 'done_pending');
+  const donePending = openTasks.filter((task) => task.status === 'done_pending').length;
+  if (donePending) flags.push(donePending === 1 ? '1 task to judge' : `${donePending} tasks to judge`);
+  else if (openTasks.length) flags.push(openTasks.length === 1 ? '1 open task' : `${openTasks.length} open tasks`);
+  if (sub.debt?.status === 'proposed') flags.push('debt awaiting signature');
+  for (const key of ['slot', 'atm']) {
+    const game = sub.games?.[key];
+    if (game && game.status === 'proposed') flags.push(`${key} terms to accept`);
+  }
+  return flags;
+}
+
+function studioAttentionList(subs) {
+  return el('section', { class: 'panel' },
+    el('h2', null, 'Needs you'),
+    el('p', { class: 'muted' }, 'Open a name to confirm claims, judge tasks, or check what is waiting on them.'),
+    el('ul', { class: 'roster' }, ...subs.map((sub) => rosterRow(sub, true))),
+  );
+}
+
+function studioRoster(book) {
+  const query = state.studioQuery.trim().toLowerCase();
+  const rows = book.subs
+    .filter((sub) => {
+      if (!query) return true;
+      return sub.handle.includes(query) || sub.title.includes(query);
+    })
+    .sort(studioSortFn(state.studioSort));
+  return el('section', { class: 'panel' },
+    el('h2', null, 'Names'),
+    el('p', { class: 'muted' }, 'Everyone in the book. Open a name to write a debt, charge, record a payment, or run games.'),
+    el('div', { class: 'roster-tools' },
+      el('label', { class: 'roster-search' },
+        el('span', null, 'Find a name'),
+        el('input', {
+          type: 'search',
+          name: 'studio-query',
+          value: state.studioQuery,
+          placeholder: 'handle or title',
+          autocomplete: 'off',
+          oninput: (event) => {
+            state.studioQuery = event.target.value;
+            render();
+            const next = document.querySelector('input[name="studio-query"]');
+            if (next) {
+              next.focus();
+              const end = next.value.length;
+              next.setSelectionRange(end, end);
+            }
+          },
+        }),
+      ),
+      el('label', null,
+        el('span', null, 'Sort'),
+        el('select', {
+          name: 'studio-sort',
+          onchange: (event) => {
+            state.studioSort = event.target.value;
+            render();
+          },
+        },
+          el('option', { value: 'attention', selected: state.studioSort === 'attention' ? true : null }, 'Needs you first'),
+          el('option', { value: 'debt', selected: state.studioSort === 'debt' ? true : null }, 'Highest debt'),
+          el('option', { value: 'sent', selected: state.studioSort === 'sent' ? true : null }, 'Most sent'),
+          el('option', { value: 'name', selected: state.studioSort === 'name' ? true : null }, 'Name'),
+          el('option', { value: 'newest', selected: state.studioSort === 'newest' ? true : null }, 'Newest'),
+        ),
+      ),
+    ),
+    rows.length
+      ? el('ul', { class: 'roster' }, ...rows.map((sub) => rosterRow(sub)))
+      : el('p', { class: 'muted' }, book.subs.length
+        ? 'No names match that search.'
+        : 'No names yet. They open one from the public page.'),
+  );
+}
+
+function studioSortFn(sort) {
+  if (sort === 'debt') {
+    return (a, b) => (b.debt?.balanceCents || 0) - (a.debt?.balanceCents || 0) || a.handle.localeCompare(b.handle);
+  }
+  if (sort === 'sent') {
+    return (a, b) => b.sentCents - a.sentCents || a.handle.localeCompare(b.handle);
+  }
+  if (sort === 'name') {
+    return (a, b) => a.handle.localeCompare(b.handle);
+  }
+  if (sort === 'newest') {
+    return (a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')) || a.handle.localeCompare(b.handle);
+  }
+  return (a, b) => {
+    const attention = studioAttention(b).length - studioAttention(a).length;
+    if (attention) return attention;
+    return (b.debt?.balanceCents || 0) - (a.debt?.balanceCents || 0) || a.handle.localeCompare(b.handle);
+  };
+}
+
+function rosterRow(sub, attentionOnly = false) {
+  const debt = sub.debt;
+  const flags = studioAttention(sub);
+  const debtLabel = debt
+    ? `${debt.status} ${money(debt.balanceCents)}`
+    : 'no debt';
+  return el('li', { class: flags.length ? 'roster-row attention' : 'roster-row' },
+    el('a', { class: 'roster-main', href: `#/studio/names/${sub.id}` },
+      el('span', { class: 'roster-who' },
+        el('strong', null, sub.handle),
+        el('span', { class: 'tag' }, sub.title),
+      ),
+      el('span', { class: 'roster-meta' },
+        el('span', null, `Debt ${debtLabel}`),
+        el('span', null, `Sent ${money(sub.sentCents)}`),
+        el('span', null, `Month ${money(sub.monthCents)}`),
+      ),
+      flags.length ? el('span', { class: 'roster-flags' }, flags.join(' · ')) : null,
+    ),
+    el('div', { class: 'roster-actions' },
+      el('a', { class: 'btn secondary small-btn', href: `#/studio/names/${sub.id}` }, 'Open'),
+      el('a', { class: 'btn secondary small-btn', href: `#/studio/games/${sub.id}` }, 'Games'),
+      !attentionOnly && flags.some((flag) => flag.includes('claim'))
+        ? el('a', { class: 'btn small-btn', href: `#/studio/names/${sub.id}` }, 'Claims')
+        : null,
+    ),
+  );
+}
+
+function studioName(subId) {
+  const sub = state.studio.subs.find((item) => item.id === subId);
+  if (!sub) {
+    shell('/studio',
+      ...banner(),
+      el('h1', null, 'Name'),
+      el('p', { class: 'lede' }, 'That name is not in the book.'),
+      el('a', { class: 'btn', href: '#/studio' }, 'Back to the studio'),
+    );
+    return;
+  }
+  const debt = sub.debt;
+  const flags = studioAttention(sub);
+  shell('/studio',
+    ...banner(),
+    el('p', { class: 'kicker' }, el('a', { href: '#/studio' }, 'Studio'), ' · Names'),
+    el('h1', null, sub.handle),
+    el('p', { class: 'lede' }, `${sub.title}. Sent ${money(sub.sentCents)}. This month ${money(sub.monthCents)}.`),
+    el('div', { class: 'grid cards' },
+      figure('Debt', debt ? money(debt.balanceCents) : 'None', debt ? debt.status : 'No debt has been written'),
+      figure('Tribute', money(sub.tributeCents), 'Recorded as tribute'),
+      figure('Ask', money(sub.askCents), `ATM holds ${money(sub.atm.balanceCents)}`),
+      figure('Waiting', flags.length ? String(flags.length) : 'Clear', flags.length ? flags[0] : 'Nothing needs you'),
+    ),
+    flags.length ? el('p', { class: 'warning' }, flags.join(' · ')) : null,
+    el('p', { class: 'row' },
+      el('a', { class: 'btn secondary', href: `#/studio/games/${sub.id}` }, 'Slot machine and ATM'),
+      el('a', { class: 'btn secondary', href: '#/studio' }, 'All names'),
+      el('span', { class: 'muted' }, `Slot: ${sub.games.slot ? GAME_STATUS[sub.games.slot.status].toLowerCase() : 'not set up'}. ATM: ${sub.games.atm ? GAME_STATUS[sub.games.atm.status].toLowerCase() : 'no terms yet'}.${sub.standing.locks.length ? ' Games are locked.' : ''}`),
+    ),
+    studioNameActions(sub),
+  );
+}
+
+function studioNameActions(sub) {
+  const debt = sub.debt;
+  return el('div', { class: 'grid split' },
+    el('section', { class: 'panel' },
+      form(`debt-${sub.id}`, (event) => proposeDebt(event, sub.id),
+        el('h2', null, 'Write a debt'),
+        field('Principal', el('input', { name: 'principal', required: true, placeholder: '500.00' })),
+        field('Interest % per year', el('input', { name: 'apr', required: true, value: '0' })),
+        field('Minimum payment', el('input', { name: 'minimum', value: '0' })),
+        field('Late fee', el('input', { name: 'lateFee', value: '0' })),
+        field('Due day (1–28)', el('input', { name: 'dueDay', required: true, value: '15' })),
+        el('button', { class: 'btn', type: 'submit' }, 'Propose it'),
+      ),
+      debt ? el('p', null, `Status ${debt.status}. ${debt.apr}% · due day ${debt.dueDay} · late fee ${money(debt.lateFeeCents)} · minimum ${money(debt.minPaymentCents)}.`) : el('p', { class: 'muted' }, 'No debt yet.'),
+      debt && (debt.status === 'active' || debt.status === 'paused') ? el('div', { class: 'row' },
+        debt.status === 'active' ? el('button', { class: 'btn secondary', type: 'button', onclick: () => debtAction(sub.id, 'pause') }, 'Pause') : null,
+        debt.status === 'paused' ? el('button', { class: 'btn secondary', type: 'button', onclick: () => debtAction(sub.id, 'resume') }, 'Resume') : null,
+        el('button', { class: 'btn secondary', type: 'button', onclick: () => debtAction(sub.id, 'settle') }, 'Settle'),
+        el('button', { class: 'btn danger', type: 'button', onclick: () => debtAction(sub.id, 'forgive') }, 'Forgive and stop'),
+      ) : null,
+      form(`charge-${sub.id}`, (event) => studioMoney(event, '/api/studio/charge', sub.id),
+        el('h3', null, 'Add a charge'),
+        field('Amount', el('input', { name: 'amount', required: true })),
+        field('Note', el('input', { name: 'note', maxlength: 140 })),
+        el('button', { class: 'btn secondary', type: 'submit' }, 'Charge'),
+      ),
+      form(`payment-${sub.id}`, (event) => recordPayment(event, sub.id),
+        el('h3', null, 'Record a payment you already received'),
+        field('Amount', el('input', { name: 'amount', required: true })),
+        field('Toward', el('select', { name: 'purpose' }, el('option', { value: 'debt' }, 'Debt'), el('option', { value: 'tribute' }, 'Tribute'))),
+        field('Note', el('input', { name: 'note', maxlength: 140 })),
+        el('button', { class: 'btn secondary', type: 'submit' }, 'Record it'),
+      ),
+      form(`task-${sub.id}`, (event) => createTask(event, sub.id),
+        el('h3', null, 'Give a task'),
+        field('Title', el('input', { name: 'title', required: true, maxlength: 80 })),
+        field('Detail', el('input', { name: 'detail', maxlength: 280 })),
+        field('Due', el('input', { name: 'due', type: 'date' })),
+        field('Penalty if missed', el('input', { name: 'penalty', value: '0' })),
+        el('button', { class: 'btn secondary', type: 'submit' }, 'Add the task'),
+      ),
+    ),
+    el('section', { class: 'panel' },
+      el('h2', null, 'Waiting on this name'),
+      claims(sub) || el('p', { class: 'muted' }, 'No claims waiting.'),
+      verdicts(sub) || el('p', { class: 'muted' }, 'No tasks to judge.'),
+      feed(sub),
+    ),
   );
 }
 
@@ -674,58 +898,6 @@ function tierEditor(book) {
       field('Line', el('input', { name: 'blurb', value: tier.blurb || '' })),
     )),
     el('button', { class: 'btn secondary', type: 'submit' }, 'Save tiers'),
-  );
-}
-
-function studioCard(sub) {
-  const debt = sub.debt;
-  return el('details', { class: 'panel', open: true },
-    el('summary', null, `${sub.handle} · ${sub.title} · sent ${money(sub.sentCents)} · debt ${debt ? money(debt.balanceCents) : 'none'}`),
-    debt ? el('p', null, `Status ${debt.status}. ${debt.apr}% · due day ${debt.dueDay} · late fee ${money(debt.lateFeeCents)} · minimum ${money(debt.minPaymentCents)}.`) : el('p', { class: 'muted' }, 'No debt yet.'),
-    el('p', { class: 'muted' }, `Ask ${money(sub.askCents)}. ATM ${money(sub.atm.balanceCents)} left of ${money(sub.atm.loadedCents)} loaded${sub.atm.frozen ? ', frozen' : ''}. This month ${money(sub.monthCents)}.`),
-    el('p', { class: 'row' },
-      el('a', { class: 'btn secondary', href: `#/studio/games/${sub.id}` }, 'Slot machine and ATM'),
-      el('span', { class: 'muted' }, `Slot: ${sub.games.slot ? GAME_STATUS[sub.games.slot.status].toLowerCase() : 'not set up'}. ATM: ${sub.games.atm ? GAME_STATUS[sub.games.atm.status].toLowerCase() : 'no terms yet'}.${sub.standing.locks.length ? ' Games are locked.' : ''}`),
-    ),
-    form(`debt-${sub.id}`, (event) => proposeDebt(event, sub.id),
-      el('h3', null, 'Write a debt'),
-      field('Principal', el('input', { name: 'principal', required: true, placeholder: '500.00' })),
-      field('Interest % per year', el('input', { name: 'apr', required: true, value: '0' })),
-      field('Minimum payment', el('input', { name: 'minimum', value: '0' })),
-      field('Late fee', el('input', { name: 'lateFee', value: '0' })),
-      field('Due day (1–28)', el('input', { name: 'dueDay', required: true, value: '15' })),
-      el('button', { class: 'btn', type: 'submit' }, 'Propose it'),
-    ),
-    debt && (debt.status === 'active' || debt.status === 'paused') ? el('div', { class: 'row' },
-      debt.status === 'active' ? el('button', { class: 'btn secondary', type: 'button', onclick: () => debtAction(sub.id, 'pause') }, 'Pause') : null,
-      debt.status === 'paused' ? el('button', { class: 'btn secondary', type: 'button', onclick: () => debtAction(sub.id, 'resume') }, 'Resume') : null,
-      el('button', { class: 'btn secondary', type: 'button', onclick: () => debtAction(sub.id, 'settle') }, 'Settle'),
-      el('button', { class: 'btn danger', type: 'button', onclick: () => debtAction(sub.id, 'forgive') }, 'Forgive and stop'),
-    ) : null,
-    form(`charge-${sub.id}`, (event) => studioMoney(event, '/api/studio/charge', sub.id),
-      el('h3', null, 'Add a charge'),
-      field('Amount', el('input', { name: 'amount', required: true })),
-      field('Note', el('input', { name: 'note', maxlength: 140 })),
-      el('button', { class: 'btn secondary', type: 'submit' }, 'Charge'),
-    ),
-    form(`payment-${sub.id}`, (event) => recordPayment(event, sub.id),
-      el('h3', null, 'Record a payment you already received'),
-      field('Amount', el('input', { name: 'amount', required: true })),
-      field('Toward', el('select', { name: 'purpose' }, el('option', { value: 'debt' }, 'Debt'), el('option', { value: 'tribute' }, 'Tribute'))),
-      field('Note', el('input', { name: 'note', maxlength: 140 })),
-      el('button', { class: 'btn secondary', type: 'submit' }, 'Record it'),
-    ),
-    form(`task-${sub.id}`, (event) => createTask(event, sub.id),
-      el('h3', null, 'Give a task'),
-      field('Title', el('input', { name: 'title', required: true, maxlength: 80 })),
-      field('Detail', el('input', { name: 'detail', maxlength: 280 })),
-      field('Due', el('input', { name: 'due', type: 'date' })),
-      field('Penalty if missed', el('input', { name: 'penalty', value: '0' })),
-      el('button', { class: 'btn secondary', type: 'submit' }, 'Add the task'),
-    ),
-    claims(sub),
-    verdicts(sub),
-    feed(sub),
   );
 }
 
@@ -1500,7 +1672,7 @@ function studioGames(subId) {
   }
   shell('/studio',
     ...banner(),
-    el('p', { class: 'kicker' }, el('a', { href: '#/studio' }, 'Studio'), ` · ${sub.handle}`),
+    el('p', { class: 'kicker' }, el('a', { href: '#/studio' }, 'Studio'), ' · ', el('a', { href: `#/studio/names/${sub.id}` }, sub.handle), ' · Games'),
     el('h1', null, 'Games'),
     el('p', { class: 'lede' }, sub.debt?.status === 'active'
       ? `Debt ${money(sub.debt.balanceCents)}. Every result adds to it, and nothing a game does can lower it.`

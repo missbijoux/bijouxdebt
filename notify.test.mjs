@@ -32,7 +32,7 @@ test('notices stay per audience and mark read only for the owner', () => {
     kind: 'claim_pending',
     title: 'alice claimed a payment',
     body: '$20.00 waiting.',
-    href: '/studio',
+    href: '/studio/names/alice',
   }, now);
 
   assert.equal(unreadNotices(book, { role: 'sub', subId: 'alice' }).length, 1);
